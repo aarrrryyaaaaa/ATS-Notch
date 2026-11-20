@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only for disposable GitHub-hosted Windows runners with an interactive desktop.
+     Local and self-hosted sessions keep visible tests skipped even with this opt-in;
+     ordinary UI tests run on a private background desktop. -->
+<RunSettings>
+  <RunConfiguration>
+    <TestCaseFilter>Category=DesktopIntegration</TestCaseFilter>
+    <EnvironmentVariables>
+      <VNOTCH_RUN_DESKTOP_TESTS>1</VNOTCH_RUN_DESKTOP_TESTS>
+    </EnvironmentVariables>
+  </RunConfiguration>
+</RunSettings>

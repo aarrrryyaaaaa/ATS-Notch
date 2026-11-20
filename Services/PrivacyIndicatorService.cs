@@ -1,0 +1,1204 @@
+using Microsoft.Win32;
+using System.IO;
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows;
+using System.Windows.Threading;
+
+namespace VNotch.Services;
+
+public sealed partial class PrivacyIndicatorService : IDisposable
+{
+    private const string NativeDll = "VNotch.Native.dll";
+
+    [LibraryImport(NativeDll)]
+    private static partial int vn_privacy_indicator_has_min_active_duration(
+        long startFileTime,
+        long utcNowTicks,
+        long minimumTicks,
+        out byte outActive);
+
+    [LibraryImport(NativeDll, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int vn_privacy_indicator_is_ignored_mic_process(
+        ReadOnlySpan<char> processName,
+        int processNameLen,
+        out byte outIgnored);
+
+    [LibraryImport(NativeDll, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int vn_privacy_indicator_normalize_app_name_slice(
+        ReadOnlySpan<char> raw,
+        int rawLen,
+        out int outStart,
+        out int outLen);
+
+    [LibraryImport(NativeDll)]
+    private static partial int vn_privacy_indicator_evaluate_mic_gate(
+        byte hasCandidate,
+        byte hasActiveSession,
+        float peakLevel,
+        float signalThreshold,
+        long holdDurationTicks,
+        long utcNowTicks,
+        ref long inoutLastSignalUtcTicks,
+        out byte outActive);
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private unsafe struct VnConsentStoreEntry
+    {
+        public long LastStartFileTime;
+        public int RawLen;
+        public int DisplayStart;
+        public int DisplayLen;
+        public fixed char RawName[260];
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct VnActiveAppSlice
+    {
+        public int NameOffset;
+        public int NameLen;
+        public long LastStartFileTime;
+    }
+
+    [LibraryImport(NativeDll, StringMarshalling = StringMarshalling.Utf16)]
+    private static partial int vn_privacy_indicator_merge_active_apps(
+        ReadOnlySpan<VnActiveAppSlice> items,
+        int itemCount,
+        ReadOnlySpan<char> charPool,
+        int charPoolLen,
+        byte sortByName,
+        Span<int> outIndices,
+        int outCap,
+        out int outCount);
+
+    private const string ConsentRoot =
+        @"Software\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore";
+
+    private static readonly TimeSpan ActivePollInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan IdlePollInterval = TimeSpan.FromSeconds(2);
+    private static readonly TimeSpan MicrophoneFlowPollInterval = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan InactiveMicrophoneFlowPollInterval = TimeSpan.FromSeconds(1);
+    private static readonly TimeSpan MinimumScreenRecordingDuration = TimeSpan.FromSeconds(2);
+    internal static readonly TimeSpan MicrophoneSignalHoldDuration = TimeSpan.FromMilliseconds(1400);
+    internal const float MicrophoneSignalThreshold = 0.0125f;
+
+    private static readonly Func<CapabilityUsage, bool> s_notIgnoredMicRule =
+        static usage => !IsIgnoredMicrophoneConsumer(usage.RawName);
+
+    private readonly Dispatcher _dispatcher;
+    private readonly TimeSpan _activeInterval;
+    private readonly Func<string, IReadOnlyList<CapabilityUsage>>? _scanCapability;
+    private readonly Func<bool>? _registryChanged;
+    private readonly MicrophoneActivityGate _microphoneActivityGate = new(
+        MicrophoneSignalThreshold,
+        MicrophoneSignalHoldDuration);
+    private readonly MicrophoneFlowProbe _microphoneFlowProbe = new();
+    private readonly ScreenRecordingProbe _screenRecordingProbe;
+    private readonly SemaphoreSlim _scanGate = new(1, 1);
+    private readonly SemaphoreSlim _micFlowGate = new(1, 1);
+    private readonly object _lifecycleLock = new();
+    private readonly HashSet<Task> _workers = new();
+    internal Task CleanupCompletion { get; private set; } = Task.CompletedTask;
+
+    private CancellationTokenSource? _workerCts;
+    private Task? _workerTask;
+    private int _currentGeneration;
+
+    private CancellationTokenSource? _micFlowCts;
+    private Task? _micFlowTask;
+    private int _micFlowGeneration;
+
+    private volatile IReadOnlyList<CapabilityUsage> _microphoneCandidates = Array.Empty<CapabilityUsage>();
+    private IReadOnlyList<string> _microphoneCandidateNames = Array.Empty<string>();
+    private IReadOnlyList<string> _cameraConsumers = Array.Empty<string>();
+    private bool _cameraInUse;
+    private bool _screenRecordingActive;
+    private bool _locationInUse;
+    private IReadOnlyList<string> _locationConsumers = Array.Empty<string>();
+    private PrivacyScanResult? _lastPublishedScan;
+    private bool _disposed;
+    private bool _started;
+
+    public event EventHandler<PrivacyIndicatorState>? StateChanged;
+
+    private PrivacyIndicatorState _currentState = PrivacyIndicatorState.Empty;
+
+    public PrivacyIndicatorState CurrentState
+    {
+        get => Volatile.Read(ref _currentState);
+        private set => Volatile.Write(ref _currentState, value);
+    }
+
+    internal IReadOnlyList<CapabilityUsage> MicrophoneCandidates => _microphoneCandidates;
+
+    public PrivacyIndicatorService(TimeSpan? pollInterval = null)
+        : this(pollInterval, null, null, new ScreenRecordingProbe())
+    {
+    }
+
+    internal PrivacyIndicatorService(TimeSpan? pollInterval,
+        Func<string, IReadOnlyList<CapabilityUsage>>? scanCapability,
+        Func<bool>? registryChanged,
+        ScreenRecordingProbe screenRecordingProbe)
+    {
+        _activeInterval = pollInterval ?? ActivePollInterval;
+        _dispatcher = Application.Current?.Dispatcher ?? Dispatcher.CurrentDispatcher;
+        _scanCapability = scanCapability;
+        _registryChanged = registryChanged;
+        _screenRecordingProbe = screenRecordingProbe;
+    }
+
+    public void Start()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_disposed || _started) return;
+            // A resumed worker must publish fresh evidence even when it matches
+            // the state observed before its indicator was disabled.
+            CurrentState = PrivacyIndicatorState.Empty;
+            _lastPublishedScan = null;
+            _started = true;
+            _currentGeneration++;
+            int generation = _currentGeneration;
+
+            _workerCts = new CancellationTokenSource();
+            var token = _workerCts.Token;
+
+            _workerTask = TrackWorkerLocked(Task.Run(() => WorkerLoopAsync(generation, token), token));
+        }
+    }
+
+    public void Stop()
+    {
+        CancellationTokenSource? ctsToCancel;
+        Task? worker;
+        lock (_lifecycleLock)
+        {
+            if (!_started) return;
+            _started = false;
+            _lastPublishedScan = null;
+            _currentGeneration++;
+            ctsToCancel = _workerCts;
+            worker = _workerTask;
+            _workerCts = null;
+            _workerTask = null;
+
+            StopMicrophoneFlowWorkerLocked();
+        }
+
+        ctsToCancel?.Cancel();
+        DisposeCancellationWhenFinished(ctsToCancel, worker);
+    }
+
+    public void Dispose()
+    {
+        lock (_lifecycleLock)
+        {
+            if (_disposed) return;
+            _disposed = true;
+        }
+
+        Stop();
+        lock (_lifecycleLock)
+        {
+            var workersSnapshot = new Task[_workers.Count];
+            _workers.CopyTo(workersSnapshot);
+            CleanupCompletion = CleanupAfterWorkersAsync(workersSnapshot);
+        }
+    }
+
+    private Task TrackWorkerLocked(Task worker)
+    {
+        _workers.RemoveWhere(static task => task.IsCompleted);
+        _workers.Add(worker);
+        return worker;
+    }
+
+    private static void DisposeCancellationWhenFinished(CancellationTokenSource? source, Task? worker)
+    {
+        if (source == null) return;
+        if (worker == null) { source.Dispose(); return; }
+        _ = worker.ContinueWith(static (_, state) => ((CancellationTokenSource)state!).Dispose(), source,
+            CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+    }
+
+    private async Task CleanupAfterWorkersAsync(Task[] workers)
+    {
+        try { await Task.WhenAll(workers).ConfigureAwait(false); }
+        catch (OperationCanceledException) { /* Expected on shutdown */ }
+        catch (Exception ex) { RuntimeLog.Error("PRIVACY", ex, "Privacy worker failed during shutdown"); }
+        finally
+        {
+            // Dispose is synchronous on the UI thread, but gates and COM probes
+            // must remain alive until every current/retired worker has exited.
+            _scanGate.Dispose();
+            _micFlowGate.Dispose();
+            _microphoneFlowProbe.Dispose();
+            lock (_lifecycleLock) _workers.Clear();
+        }
+    }
+
+    private async Task WorkerLoopAsync(int generation, CancellationToken token)
+    {
+        using var registryWake = new SemaphoreSlim(0, 1);
+        void Wake()
+        {
+            try { registryWake.Release(); }
+            catch (SemaphoreFullException) { /* Changes are coalesced. */ }
+            catch (ObjectDisposedException) { /* Retired worker. */ }
+        }
+        using var userChanges = _registryChanged == null
+            ? new RegistryChangeMonitor(Registry.CurrentUser, ConsentRoot, onChanged: Wake) : null;
+        using var machineChanges = _registryChanged == null
+            ? new RegistryChangeMonitor(Registry.LocalMachine, ConsentRoot, onChanged: Wake) : null;
+        var capabilityCache = _scanCapability != null ? new CapabilityUsageCache(_scanCapability) : null;
+        using var nativeCache = _scanCapability == null ? NativeConsentCache.Create() : null;
+        while (!token.IsCancellationRequested)
+        {
+            PrivacyScanResult? result = null;
+            try
+            {
+                await _scanGate.WaitAsync(token).ConfigureAwait(false);
+                try
+                {
+                    if (token.IsCancellationRequested || generation != _currentGeneration)
+                        break;
+
+                    DateTime utcNow = DateTime.UtcNow;
+                    bool registryChanged;
+                    if (_registryChanged != null)
+                    {
+                        registryChanged = _registryChanged();
+                    }
+                    else
+                    {
+                        bool userChanged = userChanges!.ConsumeChange();
+                        bool machineChanged = machineChanges!.ConsumeChange();
+                        registryChanged = userChanged || machineChanged;
+                    }
+                    if (nativeCache != null)
+                    {
+                        result = ExecuteNativeBackgroundScan(utcNow, nativeCache, registryChanged);
+                    }
+                    else
+                    {
+                        var capabilities = capabilityCache!.GetSnapshot(registryChanged, Environment.TickCount64);
+                        using var running = new ConsumerProcessProbe();
+                        result = BuildBackgroundScan(utcNow, capabilities[0], capabilities[1], capabilities[2], capabilities[3], capabilities[4], running);
+                    }
+                }
+                finally
+                {
+                    _scanGate.Release();
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Error("PRIVACY", ex, "PrivacyIndicatorService background scan failed");
+            }
+
+            if (token.IsCancellationRequested || generation != _currentGeneration)
+                break;
+
+            if (result != null)
+            {
+                PublishSnapshotToUi(result, generation);
+            }
+
+            TimeSpan delay = CurrentState.AnyInUse ? _activeInterval : IdlePollInterval;
+            try
+            {
+                await registryWake.WaitAsync(delay, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+        }
+    }
+
+    private PrivacyScanResult BuildBackgroundScan(DateTime utcNow, IReadOnlyList<CapabilityUsage> micUsage,
+        IReadOnlyList<CapabilityUsage> camUsage, IReadOnlyList<CapabilityUsage> programmaticCapture,
+        IReadOnlyList<CapabilityUsage> borderlessCapture, IReadOnlyList<CapabilityUsage> locationUsage, ConsumerProcessProbe running, bool nativeConsumers = false)
+    {
+        var microphoneCandidates = nativeConsumers ? micUsage : GetRelevantConsumerUsages(
+            micUsage,
+            running.IsRunning,
+            s_notIgnoredMicRule);
+        var microphoneCandidateNames = GetConsumerNames(microphoneCandidates);
+
+        var cam = nativeConsumers ? camUsage : GetRelevantConsumerUsages(camUsage, running.IsRunning);
+        var cameraConsumers = GetConsumerNames(cam);
+        bool cameraInUse = cameraConsumers.Count > 0;
+        var locationConsumers = GetConsumerNames(nativeConsumers ? locationUsage : GetRelevantConsumerUsages(locationUsage, running.IsRunning));
+        bool screenRecordingActive =
+            DetectScreenRecording(programmaticCapture, running, utcNow, nativeConsumers) ||
+            DetectScreenRecording(borderlessCapture, running, utcNow, nativeConsumers) ||
+            _screenRecordingProbe.IsRecordingWithSnapshot(running.CapturedProcessSnapshot);
+
+        return new PrivacyScanResult(
+            MicrophoneCandidates: microphoneCandidates,
+            MicrophoneCandidateNames: microphoneCandidateNames,
+            CameraConsumers: cameraConsumers,
+            CameraInUse: cameraInUse,
+            ScreenRecordingActive: screenRecordingActive,
+            LocationConsumers: locationConsumers,
+            UtcNow: utcNow);
+    }
+
+    private static bool IsIdleResultUnchanged(PrivacyScanResult? previous, PrivacyScanResult current)
+    {
+        if (previous == null) return false;
+        return previous.MicrophoneCandidates.Count == 0 &&
+               current.MicrophoneCandidates.Count == 0 &&
+               !previous.CameraInUse &&
+               !current.CameraInUse &&
+               !previous.ScreenRecordingActive &&
+               !current.ScreenRecordingActive &&
+               previous.LocationConsumers.Count == 0 &&
+               current.LocationConsumers.Count == 0;
+    }
+
+    private void PublishSnapshotToUi(PrivacyScanResult result, int generation)
+    {
+        lock (_lifecycleLock)
+        {
+            if (_disposed || !_started || generation != _currentGeneration)
+                return;
+
+            if (IsIdleResultUnchanged(_lastPublishedScan, result) &&
+                !CurrentState.AnyInUse &&
+                _micFlowTask == null)
+            {
+                return;
+            }
+            _lastPublishedScan = result;
+        }
+
+        if (_dispatcher.HasShutdownStarted) return;
+
+        void Apply()
+        {
+            lock (_lifecycleLock)
+            {
+                if (_disposed || !_started || generation != _currentGeneration)
+                    return;
+            }
+
+            ApplyScanResult(result);
+        }
+
+        if (_dispatcher.CheckAccess())
+        {
+            Apply();
+        }
+        else
+        {
+            _dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(Apply));
+        }
+    }
+
+    internal void ApplyScanResult(PrivacyScanResult result)
+    {
+        _microphoneCandidates = result.MicrophoneCandidates;
+        _microphoneCandidateNames = result.MicrophoneCandidateNames;
+        _cameraConsumers = result.CameraConsumers;
+        _cameraInUse = result.CameraInUse;
+        _screenRecordingActive = result.ScreenRecordingActive;
+        _locationConsumers = result.LocationConsumers;
+        _locationInUse = _locationConsumers.Count > 0;
+
+        if (_microphoneCandidates.Count > 0)
+        {
+            // Camera, capture and location changes must not wait for a microphone
+            // probe, which can fail or block independently of the registry scan.
+            PublishState(CurrentState.MicrophoneInUse, MicrophoneFlowEvidence.Empty);
+            lock (_lifecycleLock)
+            {
+                StartMicrophoneFlowWorkerLocked();
+            }
+        }
+        else
+        {
+            lock (_lifecycleLock)
+            {
+                StopMicrophoneFlowWorkerLocked();
+            }
+            _microphoneActivityGate.Reset();
+            PublishState(microphoneInUse: false, MicrophoneFlowEvidence.Empty);
+        }
+    }
+
+    private void StartMicrophoneFlowWorkerLocked()
+    {
+        if (_micFlowTask is { IsCompleted: false } && _micFlowCts is { IsCancellationRequested: false })
+            return;
+
+        if (_disposed || !_started) return;
+
+        try { _micFlowCts?.Dispose(); } catch (ObjectDisposedException) { /* Already disposed */ }
+        _micFlowGeneration++;
+        int generation = _micFlowGeneration;
+        _micFlowCts = new CancellationTokenSource();
+        var token = _micFlowCts.Token;
+        _micFlowTask = TrackWorkerLocked(Task.Run(() => MicrophoneFlowWorkerLoopAsync(generation, token), token));
+    }
+
+    private void StopMicrophoneFlowWorkerLocked()
+    {
+        _micFlowGeneration++;
+        var cts = _micFlowCts;
+        var worker = _micFlowTask;
+        _micFlowCts = null;
+        _micFlowTask = null;
+        cts?.Cancel();
+        DisposeCancellationWhenFinished(cts, worker);
+    }
+
+    private async Task MicrophoneFlowWorkerLoopAsync(int generation, CancellationToken token)
+    {
+        while (!token.IsCancellationRequested)
+        {
+            TimeSpan pollInterval = InactiveMicrophoneFlowPollInterval;
+            try
+            {
+                await _micFlowGate.WaitAsync(token).ConfigureAwait(false);
+                try
+                {
+                    if (token.IsCancellationRequested || generation != _micFlowGeneration)
+                        break;
+
+                    var candidates = _microphoneCandidates;
+                    if (candidates.Count == 0)
+                        break;
+
+                    DateTime utcNow = DateTime.UtcNow;
+                    MicrophoneFlowEvidence evidence = _microphoneFlowProbe.Probe(candidates);
+                    if (evidence.HasActiveSession)
+                        pollInterval = MicrophoneFlowPollInterval;
+
+                    bool microphoneInUse = _microphoneActivityGate.Evaluate(
+                        hasCandidate: candidates.Count > 0,
+                        hasActiveSession: evidence.HasActiveSession,
+                        peakLevel: evidence.PeakLevel,
+                        utcNow);
+
+                    PublishMicStateToUi(microphoneInUse, evidence, generation);
+                }
+                finally
+                {
+                    _micFlowGate.Release();
+                }
+
+                await Task.Delay(pollInterval, token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Error("PRIVACY-MIC", ex, "Microphone flow worker loop error");
+                try
+                {
+                    await Task.Delay(InactiveMicrophoneFlowPollInterval, token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+            }
+        }
+    }
+
+    private void PublishMicStateToUi(bool microphoneInUse, MicrophoneFlowEvidence evidence, int generation)
+    {
+        lock (_lifecycleLock)
+        {
+            if (_disposed || !_started || generation != _micFlowGeneration)
+                return;
+        }
+
+        if (_dispatcher.HasShutdownStarted) return;
+
+        void Apply()
+        {
+            bool changed;
+            PrivacyIndicatorState next;
+            lock (_lifecycleLock)
+            {
+                if (_disposed || !_started || generation != _micFlowGeneration)
+                    return;
+
+                changed = TryUpdateState(microphoneInUse, evidence, out next);
+            }
+
+            // Raise outside _lifecycleLock so subscribers cannot deadlock against lifecycle calls.
+            if (changed) StateChanged?.Invoke(this, next);
+        }
+
+        if (_dispatcher.CheckAccess())
+        {
+            Apply();
+        }
+        else
+        {
+            _dispatcher.BeginInvoke(DispatcherPriority.Normal, new Action(Apply));
+        }
+    }
+
+    internal void PollMicrophoneFlow()
+    {
+        try
+        {
+            var candidates = _microphoneCandidates;
+            MicrophoneFlowEvidence evidence = candidates.Count > 0
+                ? _microphoneFlowProbe.Probe(candidates)
+                : MicrophoneFlowEvidence.Empty;
+
+            bool microphoneInUse = _microphoneActivityGate.Evaluate(
+                hasCandidate: candidates.Count > 0,
+                hasActiveSession: evidence.HasActiveSession,
+                peakLevel: evidence.PeakLevel,
+                DateTime.UtcNow);
+
+            PublishState(microphoneInUse, evidence);
+        }
+        catch (Exception ex)
+        {
+            _microphoneActivityGate.Reset();
+            PublishState(microphoneInUse: false, MicrophoneFlowEvidence.Empty);
+            RuntimeLog.Error("PRIVACY-MIC", ex, "Microphone flow probe failed");
+        }
+    }
+
+    private void PublishState(bool microphoneInUse, MicrophoneFlowEvidence evidence)
+    {
+        if (TryUpdateState(microphoneInUse, evidence, out var next))
+            StateChanged?.Invoke(this, next);
+    }
+
+    private bool TryUpdateState(bool microphoneInUse, MicrophoneFlowEvidence evidence, out PrivacyIndicatorState next)
+    {
+        next = new PrivacyIndicatorState(
+            MicrophoneInUse: microphoneInUse,
+            CameraInUse: _cameraInUse,
+            ScreenRecordingActive: _screenRecordingActive,
+            MicrophoneConsumers: microphoneInUse
+                ? _microphoneCandidateNames
+                : Array.Empty<string>(),
+            CameraConsumers: _cameraConsumers)
+        {
+            LocationInUse = _locationInUse,
+            LocationConsumers = _locationConsumers
+        };
+
+        if (next.Equals(CurrentState)) return false;
+
+        bool microphoneChanged = next.MicrophoneInUse != CurrentState.MicrophoneInUse;
+        CurrentState = next;
+        if (microphoneChanged)
+        {
+            RuntimeLog.Debug("PRIVACY-MIC", () =>
+                $"visible={microphoneInUse} session={evidence.HasActiveSession} " +
+                $"peak={evidence.PeakLevel:F4} consumers=[{string.Join(", ", _microphoneCandidateNames)}]");
+        }
+        return true;
+    }
+
+    internal sealed record PrivacyScanResult(
+        IReadOnlyList<CapabilityUsage> MicrophoneCandidates,
+        IReadOnlyList<string> MicrophoneCandidateNames,
+        IReadOnlyList<string> CameraConsumers,
+        bool CameraInUse,
+        bool ScreenRecordingActive,
+        IReadOnlyList<string> LocationConsumers,
+        DateTime UtcNow);
+
+    internal sealed class CapabilityUsageCache(Func<string, IReadOnlyList<CapabilityUsage>> scanCapability)
+    {
+        private static readonly string[] CapabilityNames =
+        {
+            "microphone", "webcam", "graphicsCaptureProgrammatic", "graphicsCaptureWithoutBorder", "location"
+        };
+        private IReadOnlyList<CapabilityUsage>[]? _snapshot;
+        private long _nextFullScan;
+
+        internal IReadOnlyList<CapabilityUsage>[] GetSnapshot(bool registryChanged, long now)
+        {
+            bool fullScan = _snapshot == null || registryChanged || now >= _nextFullScan;
+            if (!fullScan && !HasAnyUsages(_snapshot!))
+                return _snapshot!;
+
+            // Refresh open intervals each poll without repeatedly scanning idle
+            // capabilities. Full scans still reconcile missed start notifications.
+            var next = new IReadOnlyList<CapabilityUsage>[CapabilityNames.Length];
+            for (int i = 0; i < next.Length; i++)
+                next[i] = fullScan || _snapshot![i].Count > 0
+                    ? scanCapability(CapabilityNames[i])
+                    : _snapshot[i];
+
+            _snapshot = next;
+            if (fullScan)
+                _nextFullScan = now + 30_000;
+
+            return _snapshot;
+        }
+
+        private static bool HasAnyUsages(IReadOnlyList<CapabilityUsage>[] snapshot)
+        {
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                if (snapshot[i].Count > 0) return true;
+            }
+            return false;
+        }
+    }
+
+    internal static IReadOnlyList<CapabilityUsage> GetRelevantConsumerUsages(
+        IEnumerable<CapabilityUsage> usages,
+        Func<string, bool> isRunning,
+        Func<CapabilityUsage, bool>? additionalRule = null)
+    {
+        if (usages is IReadOnlyCollection<CapabilityUsage> { Count: 0 })
+            return Array.Empty<CapabilityUsage>();
+
+        List<CapabilityUsage>? filtered = null;
+        foreach (var usage in usages)
+        {
+            if ((additionalRule != null && !additionalRule(usage)) || !isRunning(usage.RawName))
+                continue;
+
+            filtered ??= new List<CapabilityUsage>();
+            filtered.Add(usage);
+        }
+        if (filtered == null) return Array.Empty<CapabilityUsage>();
+        if (filtered.Count == 1) return new[] { filtered[0] };
+
+        if (TryMergeActiveApps(filtered, useDisplayName: false, sortByName: false, out int[]? indices, out int mergedCount) && indices != null)
+        {
+            var merged = new CapabilityUsage[mergedCount];
+            for (int i = 0; i < mergedCount; i++)
+                merged[i] = filtered[indices[i]];
+            return merged;
+        }
+        return Array.Empty<CapabilityUsage>();
+    }
+
+    internal static IReadOnlyList<string> GetConsumerNames(IReadOnlyList<CapabilityUsage> usages)
+    {
+        int count = usages.Count;
+        if (count == 0) return Array.Empty<string>();
+        if (count == 1) return new[] { usages[0].DisplayName };
+
+        if (TryMergeActiveApps(usages, useDisplayName: true, sortByName: true, out int[]? indices, out int mergedCount) && indices != null)
+        {
+            var sorted = new string[mergedCount];
+            for (int i = 0; i < mergedCount; i++)
+                sorted[i] = usages[indices[i]].DisplayName;
+            return sorted;
+        }
+        return Array.Empty<string>();
+    }
+
+    private static bool TryMergeActiveApps(
+        IReadOnlyList<CapabilityUsage> usages,
+        bool useDisplayName,
+        bool sortByName,
+        out int[]? outIndices,
+        out int outCount)
+    {
+        outIndices = null;
+        outCount = 0;
+        int count = usages.Count;
+        if (count <= 0) return false;
+
+        int totalChars = 0;
+        for (int i = 0; i < count; i++)
+        {
+            string s = (useDisplayName ? usages[i].DisplayName : usages[i].RawName) ?? string.Empty;
+            totalChars += s.Length;
+        }
+
+        Span<VnActiveAppSlice> slices = count <= 64 ? stackalloc VnActiveAppSlice[count] : new VnActiveAppSlice[count];
+        Span<char> charPool = totalChars <= 2048 ? stackalloc char[Math.Max(1, totalChars)] : new char[Math.Max(1, totalChars)];
+        int offset = 0;
+        for (int i = 0; i < count; i++)
+        {
+            string s = (useDisplayName ? usages[i].DisplayName : usages[i].RawName) ?? string.Empty;
+            s.AsSpan().CopyTo(charPool.Slice(offset, s.Length));
+            slices[i] = new VnActiveAppSlice
+            {
+                NameOffset = offset,
+                NameLen = s.Length,
+                LastStartFileTime = useDisplayName ? 0 : usages[i].LastStartFileTime
+            };
+            offset += s.Length;
+        }
+
+        int[] indices = new int[count];
+        int status = vn_privacy_indicator_merge_active_apps(
+            slices,
+            count,
+            charPool[..offset],
+            offset,
+            sortByName ? (byte)1 : (byte)0,
+            indices,
+            indices.Length,
+            out int mergedCount);
+        if (status != 0 || mergedCount < 0 || mergedCount > count)
+            return false;
+
+        outIndices = indices;
+        outCount = mergedCount;
+        return true;
+    }
+
+    internal static bool UpdateMicrophoneCandidateNames(
+        IReadOnlyList<CapabilityUsage> candidates, ref string[] cachedNames)
+    {
+        bool changed = cachedNames.Length != candidates.Count;
+        for (int i = 0; !changed && i < candidates.Count; i++)
+            changed = !StringComparer.OrdinalIgnoreCase.Equals(cachedNames[i], candidates[i].RawName);
+
+        if (!changed) return false;
+
+        var names = candidates.Count == 0 ? Array.Empty<string>() : new string[candidates.Count];
+        for (int i = 0; i < names.Length; i++)
+            names[i] = candidates[i].RawName;
+        cachedNames = names;
+        return true;
+    }
+
+    private static unsafe CapabilityUsage[] BuildConsentUsages(ReadOnlySpan<VnConsentStoreEntry> entries)
+    {
+        var result = new CapabilityUsage[entries.Length];
+        for (int i = 0; i < entries.Length; i++)
+        {
+            int rawLen = Math.Clamp(entries[i].RawLen, 0, 259);
+            string raw;
+            fixed (char* ptr = entries[i].RawName)
+            {
+                raw = new string(ptr, 0, rawLen);
+            }
+            int dispStart = Math.Clamp(entries[i].DisplayStart, 0, rawLen);
+            int dispLen = Math.Clamp(entries[i].DisplayLen, 0, rawLen - dispStart);
+            string display = (dispStart == 0 && dispLen == rawLen) ? raw : raw.Substring(dispStart, dispLen);
+            result[i] = new CapabilityUsage(raw, display, entries[i].LastStartFileTime);
+        }
+        return result;
+    }
+
+    internal static bool IsActiveUsage(long? lastStart, long? lastStop) =>
+        lastStart is > 0 && lastStop == 0;
+
+    private static bool DetectScreenRecording(
+        IReadOnlyList<CapabilityUsage> usages,
+        ConsumerProcessProbe running,
+        DateTime utcNow, bool consumersFiltered = false)
+    {
+        for (int i = 0; i < usages.Count; i++)
+        {
+            var usage = usages[i];
+            if ((consumersFiltered || running.IsRunning(usage.RawName)) &&
+                HasMinimumActiveDuration(usage.LastStartFileTime, utcNow, MinimumScreenRecordingDuration))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    internal static bool HasMinimumActiveDuration(long startFileTime, DateTime utcNow, TimeSpan minimum)
+        => vn_privacy_indicator_has_min_active_duration(startFileTime, utcNow.Ticks, minimum.Ticks, out byte active) == 0 && active != 0;
+
+    internal static bool IsIgnoredMicrophoneConsumer(
+        string rawConsumer,
+        IReadOnlySet<string>? serviceExecutablePaths = null)
+    {
+        string? executablePath = TryDecodeDesktopConsumerPath(rawConsumer);
+        string processName = executablePath == null
+            ? NormalizeAppName(rawConsumer)
+            : Path.GetFileNameWithoutExtension(executablePath);
+
+        ReadOnlySpan<char> procSpan = processName is not null ? processName.AsSpan() : ReadOnlySpan<char>.Empty;
+        if (vn_privacy_indicator_is_ignored_mic_process(procSpan, procSpan.Length, out byte ignored) == 0 && ignored != 0)
+            return true;
+
+        if (executablePath == null || serviceExecutablePaths == null || serviceExecutablePaths.Count == 0)
+            return false;
+        return serviceExecutablePaths.Contains(NormalizeExecutablePath(executablePath));
+    }
+
+    internal static string? TryDecodeDesktopConsumerPath(string rawConsumer)
+    {
+        if (string.IsNullOrWhiteSpace(rawConsumer) || !rawConsumer.Contains('#')) return null;
+
+        string decoded = rawConsumer.Replace('#', Path.DirectorySeparatorChar);
+        try
+        {
+            return NormalizeExecutablePath(decoded);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static string NormalizeExecutablePath(string path)
+    {
+        string expanded = Environment.ExpandEnvironmentVariables(path.Trim().Trim('"'));
+        if (expanded.StartsWith(@"\SystemRoot\", StringComparison.OrdinalIgnoreCase))
+        {
+            expanded = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                expanded[12..]);
+        }
+        return Path.GetFullPath(expanded).TrimEnd(Path.DirectorySeparatorChar);
+    }
+
+    // Capture sessions, meters and endpoint notifications live in Native/Services/MicrophoneProbe.cpp. This class
+    // keeps the topology-refresh schedule and decides which processes count as a consumer.
+    private sealed unsafe partial class MicrophoneFlowProbe : IDisposable
+    {
+
+        [LibraryImport(NativeDll, EntryPoint = "vn_mic_probe_create")]
+        private static partial int NativeCreate(nint callback, long context, out long handle, out int hresult);
+
+        [LibraryImport(NativeDll, EntryPoint = "vn_mic_probe_destroy")]
+        private static partial int NativeDestroy(long handle);
+
+        [LibraryImport(NativeDll, EntryPoint = "vn_mic_probe_clear")]
+        private static partial int NativeClear(long handle);
+
+        [LibraryImport(NativeDll, EntryPoint = "vn_mic_probe_rebuild")]
+        private static partial int NativeRebuild(long handle, out int count, out int hresult);
+
+        [LibraryImport(NativeDll, EntryPoint = "vn_mic_probe_get_process_id")]
+        private static partial int NativeGetProcessId(long handle, int index, out uint processId);
+
+        [LibraryImport(NativeDll, EntryPoint = "vn_mic_probe_keep")]
+        private static partial int NativeKeep(long handle, uint* processIds, int count, out int remaining);
+
+        [LibraryImport(NativeDll, EntryPoint = "vn_mic_probe_sample")]
+        private static partial int NativeSample(long handle, out byte hasActive, out float peak, out byte anyInvalid);
+
+        private long _probeHandle;
+        private GCHandle _self;
+        private int _meterCount;
+        private string[] _cachedCandidateNames = Array.Empty<string>();
+        private bool _isTopologyValid;
+        private int _deviceVersion;
+        private long _lastRebuildTicks;
+        private readonly object _probeLock = new();
+
+        public MicrophoneFlowEvidence Probe(IReadOnlyList<CapabilityUsage> candidates)
+        {
+            if (candidates.Count == 0)
+            {
+                lock (_probeLock)
+                {
+                    InvalidateCacheLocked();
+                }
+                return MicrophoneFlowEvidence.Empty;
+            }
+
+            lock (_probeLock)
+            {
+                EnsureTopologyLocked(candidates);
+
+                var (hasActiveSession, peakLevel, anyInvalid) = SampleLocked();
+                // A session that expired, was muted or failed means the cached topology is stale.
+                if (anyInvalid) Volatile.Write(ref _isTopologyValid, false);
+
+                // If topology became invalid during sampling and we had no active session,
+                // rebuild topology immediately if rate limit allows.
+                if (!Volatile.Read(ref _isTopologyValid) && !hasActiveSession)
+                {
+                    long now = Stopwatch.GetTimestamp();
+                    double elapsedSec = (double)(now - _lastRebuildTicks) / Stopwatch.Frequency;
+                    if (elapsedSec >= 1.0)
+                    {
+                        RebuildTopologyLocked(candidates);
+                        var (rebuiltActive, rebuiltPeak, _) = SampleLocked();
+                        hasActiveSession |= rebuiltActive;
+                        if (rebuiltPeak > peakLevel) peakLevel = rebuiltPeak;
+                    }
+                }
+
+                if (!float.IsFinite(peakLevel) || peakLevel < 0)
+                    peakLevel = 0;
+
+                return new MicrophoneFlowEvidence(
+                    hasActiveSession,
+                    Math.Clamp(peakLevel, 0, 1));
+            }
+        }
+
+        private (bool HasActive, float Peak, bool AnyInvalid) SampleLocked()
+        {
+            if (_probeHandle == 0 || _meterCount == 0) return (false, 0f, false);
+            return NativeSample(_probeHandle, out byte hasActive, out float peak, out byte anyInvalid) == 0
+                ? (hasActive != 0, peak, anyInvalid != 0)
+                : (false, 0f, true);
+        }
+
+        private void EnsureTopologyLocked(IReadOnlyList<CapabilityUsage> candidates)
+        {
+            if (UpdateMicrophoneCandidateNames(candidates, ref _cachedCandidateNames))
+            {
+                Volatile.Write(ref _isTopologyValid, false);
+            }
+
+            if (Volatile.Read(ref _isTopologyValid) && _meterCount > 0)
+                return;
+
+            long now = Stopwatch.GetTimestamp();
+            double elapsedSec = (double)(now - _lastRebuildTicks) / Stopwatch.Frequency;
+
+            // If topology is invalid, or if we found 0 active sessions and at least 1s elapsed since last attempt:
+            if (!Volatile.Read(ref _isTopologyValid) || (_meterCount == 0 && elapsedSec >= 1.0))
+            {
+                RebuildTopologyLocked(candidates);
+            }
+        }
+
+        private void RebuildTopologyLocked(IReadOnlyList<CapabilityUsage> candidates)
+        {
+            _lastRebuildTicks = Stopwatch.GetTimestamp();
+            int version = Volatile.Read(ref _deviceVersion);
+            InvalidateCacheLocked();
+
+            using var processProbe = new ConsumerProcessProbe();
+
+            try
+            {
+                EnsureProbeLocked();
+                if (_probeHandle == 0) return;
+
+                if (NativeRebuild(_probeHandle, out int count, out int hresult) != 0)
+                {
+                    RuntimeLog.Warn("PRIVACY-MIC", $"Topology rebuild failed: 0x{hresult:X8}");
+                    InvalidateCacheLocked();
+                    DisposeProbeLocked();
+                    return;
+                }
+
+                // Keep only sessions that belong to one of the consumers reported by the capability store.
+                int capacity = Math.Max(0, count);
+                Span<uint> keepSpan = capacity <= 64 ? stackalloc uint[capacity] : new uint[capacity];
+                int keepCount = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    if (NativeGetProcessId(_probeHandle, i, out uint processId) != 0) continue;
+                    for (int c = 0; c < candidates.Count; c++)
+                    {
+                        if (processProbe.MatchesProcess(candidates[c].RawName, processId))
+                        {
+                            keepSpan[keepCount++] = processId;
+                            break;
+                        }
+                    }
+                }
+
+                if (keepCount == 0)
+                {
+                    NativeKeep(_probeHandle, null, 0, out _meterCount);
+                }
+                else
+                {
+                    fixed (uint* pinned = keepSpan)
+                    {
+                        NativeKeep(_probeHandle, pinned, keepCount, out _meterCount);
+                    }
+                }
+
+                Volatile.Write(ref _isTopologyValid, Volatile.Read(ref _deviceVersion) == version);
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Warn("PRIVACY-MIC", $"Topology rebuild failed: {ex.Message}");
+                InvalidateCacheLocked();
+                DisposeProbeLocked();
+            }
+        }
+
+        private void EnsureProbeLocked()
+        {
+            if (_probeHandle != 0) return;
+            _self = GCHandle.Alloc(this);
+            delegate* unmanaged[Stdcall]<long, void> callback = &OnNativeInvalidated;
+            if (NativeCreate((nint)callback, GCHandle.ToIntPtr(_self), out long handle, out int hresult) != 0)
+            {
+                RuntimeLog.Warn("PRIVACY-MIC", $"Failed to register endpoint notification callback: 0x{hresult:X8}");
+                _self.Free();
+                return;
+            }
+
+            _probeHandle = handle;
+        }
+
+        // Runs on a Core Audio thread: only flag the topology as stale.
+        [UnmanagedCallersOnly(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvStdcall)])]
+        private static void OnNativeInvalidated(long context)
+        {
+            try
+            {
+                if (GCHandle.FromIntPtr((IntPtr)context).Target is MicrophoneFlowProbe probe)
+                    probe.OnDeviceNotification();
+            }
+            catch (Exception)
+            {
+                // Exceptions must not unwind into the native notification thread.
+            }
+        }
+
+        private void OnDeviceNotification()
+        {
+            Interlocked.Increment(ref _deviceVersion);
+            Volatile.Write(ref _isTopologyValid, false);
+        }
+
+        private void InvalidateCacheLocked()
+        {
+            Volatile.Write(ref _isTopologyValid, false);
+            if (_probeHandle != 0) NativeClear(_probeHandle);
+            _meterCount = 0;
+        }
+
+        public void Dispose()
+        {
+            lock (_probeLock)
+            {
+                InvalidateCacheLocked();
+                DisposeProbeLocked();
+            }
+        }
+
+        private void DisposeProbeLocked()
+        {
+            if (_probeHandle == 0) return;
+            NativeDestroy(_probeHandle);
+            _probeHandle = 0;
+            if (_self.IsAllocated) _self.Free();
+        }
+    }
+    internal sealed class MicrophoneActivityGate
+    {
+        private readonly float _signalThreshold;
+        private readonly TimeSpan _holdDuration;
+        private long _lastSignalUtcTicks = DateTime.MinValue.Ticks;
+
+        public MicrophoneActivityGate(float signalThreshold, TimeSpan holdDuration)
+        {
+            _signalThreshold = Math.Max(0, signalThreshold);
+            _holdDuration = holdDuration < TimeSpan.Zero ? TimeSpan.Zero : holdDuration;
+        }
+
+        public bool Evaluate(
+            bool hasCandidate,
+            bool hasActiveSession,
+            float peakLevel,
+            DateTime utcNow)
+        {
+            long lastTicks = Interlocked.Read(ref _lastSignalUtcTicks);
+            if (vn_privacy_indicator_evaluate_mic_gate(
+                    hasCandidate ? (byte)1 : (byte)0,
+                    hasActiveSession ? (byte)1 : (byte)0,
+                    peakLevel,
+                    _signalThreshold,
+                    _holdDuration.Ticks,
+                    utcNow.Ticks,
+                    ref lastTicks,
+                    out byte active) == 0)
+            {
+                Interlocked.Exchange(ref _lastSignalUtcTicks, lastTicks);
+                return active != 0;
+            }
+            return false;
+        }
+
+        public void Reset() => Interlocked.Exchange(ref _lastSignalUtcTicks, DateTime.MinValue.Ticks);
+    }
+
+    private static string NormalizeAppName(string raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw)) return raw;
+        ReadOnlySpan<char> rawSpan = raw.AsSpan();
+        if (vn_privacy_indicator_normalize_app_name_slice(rawSpan, rawSpan.Length, out int start, out int len) == 0)
+        {
+            return start == 0 && len == raw.Length ? raw : raw.Substring(start, len);
+        }
+        return raw;
+    }
+}
+
+internal readonly record struct CapabilityUsage(
+    string RawName,
+    string DisplayName,
+    long LastStartFileTime);
+
+internal readonly record struct MicrophoneFlowEvidence(
+    bool HasActiveSession,
+    float PeakLevel)
+{
+    public static readonly MicrophoneFlowEvidence Empty = new(false, 0);
+}
+
+public sealed record PrivacyIndicatorState(
+    bool MicrophoneInUse,
+    bool CameraInUse,
+    bool ScreenRecordingActive,
+    IReadOnlyList<string> MicrophoneConsumers,
+    IReadOnlyList<string> CameraConsumers)
+{
+    public bool LocationInUse { get; init; }
+    public IReadOnlyList<string> LocationConsumers { get; init; } = Array.Empty<string>();
+
+    public static readonly PrivacyIndicatorState Empty = new(
+        false, false, false, Array.Empty<string>(), Array.Empty<string>());
+
+    public bool AnyInUse => MicrophoneInUse || CameraInUse || ScreenRecordingActive || LocationInUse;
+
+    public bool Equals(PrivacyIndicatorState? other)
+    {
+        if (other is null) return false;
+        if (MicrophoneInUse != other.MicrophoneInUse) return false;
+        if (CameraInUse != other.CameraInUse) return false;
+        if (ScreenRecordingActive != other.ScreenRecordingActive) return false;
+        if (LocationInUse != other.LocationInUse) return false;
+        return SequenceEquals(MicrophoneConsumers, other.MicrophoneConsumers)
+            && SequenceEquals(CameraConsumers, other.CameraConsumers)
+            && SequenceEquals(LocationConsumers, other.LocationConsumers);
+    }
+
+    public override int GetHashCode()
+    {
+        var hash = HashCode.Combine(MicrophoneInUse, CameraInUse, ScreenRecordingActive, LocationInUse);
+        for (int i = 0; i < MicrophoneConsumers.Count; i++)
+            hash = HashCode.Combine(hash, StringComparer.OrdinalIgnoreCase.GetHashCode(MicrophoneConsumers[i]));
+        for (int i = 0; i < CameraConsumers.Count; i++)
+            hash = HashCode.Combine(hash, StringComparer.OrdinalIgnoreCase.GetHashCode(CameraConsumers[i]));
+        for (int i = 0; i < LocationConsumers.Count; i++)
+            hash = HashCode.Combine(hash, StringComparer.OrdinalIgnoreCase.GetHashCode(LocationConsumers[i]));
+        return hash;
+    }
+
+    private static bool SequenceEquals(IReadOnlyList<string> a, IReadOnlyList<string> b)
+    {
+        if (a.Count != b.Count) return false;
+        for (int i = 0; i < a.Count; i++)
+        {
+            if (!string.Equals(a[i], b[i], StringComparison.OrdinalIgnoreCase)) return false;
+        }
+        return true;
+    }
+}

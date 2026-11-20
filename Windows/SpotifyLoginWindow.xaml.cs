@@ -1,0 +1,457 @@
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Windows;
+using System.Windows.Input;
+using System.Windows.Interop;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Threading;
+using Microsoft.Web.WebView2.Core;
+using VNotch.Services;
+
+namespace VNotch;
+
+public partial class SpotifyLoginWindow : Window
+{
+    private const string LogCategory = "SPOTIFY-LOGIN";
+#pragma warning disable S1075 // Spotify login and cookie endpoints
+    private static readonly string SpotifyLoginUrl = string.Concat("https://", "accounts.spotify.com/login?continue=https%3A%2F%2Fopen.spotify.com%2F");
+    private static readonly string SpotifyCookieUrl = string.Concat("https://", "open.spotify.com/");
+#pragma warning restore S1075
+
+    private const double ShellMarginDip = 18;
+    private const double ShellCornerRadiusDip = 24;
+
+    private readonly UiScheduledTimer _cookieTimer;
+    private bool _cookieCheckInProgress;
+    private string? _userDataFolder;
+    private IDisposable? _profileCleanupLease;
+
+    public string SpotifySpDc { get; private set; } = "";
+
+    public SpotifyLoginWindow()
+    {
+        InitializeComponent();
+
+        Language = System.Windows.Markup.XmlLanguage.GetLanguage(Loc.GetCulture().IetfLanguageTag);
+        Title = Loc.Get("spotifyLogin.title");
+        HeadingText.Text = Loc.Get("spotifyLogin.heading");
+        HintText.Text = Loc.Get("spotifyLogin.hint");
+        StatusText.Text = Loc.Get("spotifyLogin.opening");
+        CancelButton.Content = Loc.Get("spotifyLogin.cancel");
+
+        _cookieTimer = new UiScheduledTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromSeconds(1)
+        };
+        _cookieTimer.Tick += CookieTimer_Tick;
+        Loaded += SpotifyLoginWindow_Loaded;
+        SizeChanged += (_, _) => ApplyRoundedWindowRegion();
+        DpiChanged += (_, _) => ApplyRoundedWindowRegion();
+    }
+
+    protected override void OnSourceInitialized(EventArgs e)
+    {
+        base.OnSourceInitialized(e);
+        ApplyRoundedWindowRegion();
+    }
+
+    private void ApplyRoundedWindowRegion()
+    {
+        IntPtr hwnd = new WindowInteropHelper(this).Handle;
+        if (hwnd == IntPtr.Zero)
+            return;
+
+        double widthDip = ActualWidth > 0 ? ActualWidth : Width;
+        double heightDip = ActualHeight > 0 ? ActualHeight : Height;
+        uint dpi = Win32Interop.GetDpiForWindow(hwnd);
+        double dpiScale = dpi > 0 ? dpi / 96.0 : 1.0;
+
+        var regionBounds = CalculateRoundedWindowRegion(widthDip, heightDip, dpiScale);
+        // The window owns the region after success; the native layer releases it on failure.
+        Win32Interop.SetRoundedWindowRegion(
+            hwnd,
+            regionBounds.Left,
+            regionBounds.Top,
+            regionBounds.Right,
+            regionBounds.Bottom,
+            regionBounds.CornerDiameter,
+            regionBounds.CornerDiameter);
+    }
+
+    [StructLayout(LayoutKind.Sequential, Pack = 1)]
+    private struct VnRoundedWindowRegion
+    {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+        public int CornerDiameter;
+    }
+
+    [LibraryImport("VNotch.Native.dll")]
+    private static partial int vn_window_calc_rounded_region(
+        double widthDip,
+        double heightDip,
+        double marginDip,
+        double cornerRadiusDip,
+        double dpiScale,
+        out VnRoundedWindowRegion outRegion);
+
+    internal static RoundedWindowRegion CalculateRoundedWindowRegion(
+        double widthDip,
+        double heightDip,
+        double dpiScale)
+    {
+        _ = vn_window_calc_rounded_region(
+            widthDip, heightDip, ShellMarginDip, ShellCornerRadiusDip, dpiScale, out var r);
+        return new RoundedWindowRegion(r.Left, r.Top, r.Right, r.Bottom, r.CornerDiameter);
+    }
+
+    internal readonly record struct RoundedWindowRegion(
+        int Left,
+        int Top,
+        int Right,
+        int Bottom,
+        int CornerDiameter);
+
+    private CancellationTokenRegistration _privacyCancellation;
+    private bool _webViewDisposed;
+
+    private async void SpotifyLoginWindow_Loaded(object sender, RoutedEventArgs e)
+    {
+        Loaded -= SpotifyLoginWindow_Loaded;
+        if (!NetworkPrivacy.Current.IsAllowed(NetworkFeature.Canvas)) { _isClosing = true; Close(); return; }
+        _privacyCancellation = NetworkPrivacy.Current.Acquire(NetworkFeature.Canvas).Register(() =>
+            Dispatcher.BeginInvoke(() =>
+            {
+                _isClosing = true;
+                DisposeWebViewOnce();
+                Close();
+            }));
+        PlayEntranceAnimation();
+        try
+        {
+            _userDataFolder = Path.Combine(
+                AppPaths.LocalAppDataRoot,
+                "SpotifyWebView2",
+                Guid.NewGuid().ToString("N"));
+            _profileCleanupLease = AppFileCleanupService.Protect(_userDataFolder);
+            Directory.CreateDirectory(_userDataFolder);
+
+            CoreWebView2Environment environment =
+                await CoreWebView2Environment.CreateAsync(userDataFolder: _userDataFolder);
+            if (_webViewDisposed || _isClosing) return;
+            CoreWebView2ControllerOptions controllerOptions = environment.CreateCoreWebView2ControllerOptions();
+            controllerOptions.IsInPrivateModeEnabled = true;
+            await SpotifyWebView.EnsureCoreWebView2Async(environment, controllerOptions);
+
+            if (_webViewDisposed || _isClosing || !NetworkPrivacy.Current.IsAllowed(NetworkFeature.Canvas))
+            {
+                _isClosing = true;
+                DisposeWebViewOnce();
+                Close();
+                return;
+            }
+            SpotifyWebView.CoreWebView2.Settings.AreDevToolsEnabled = false;
+            SpotifyWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
+            SpotifyWebView.CoreWebView2.Settings.AreHostObjectsAllowed = false;
+            SpotifyWebView.CoreWebView2.Settings.IsWebMessageEnabled = false;
+            SpotifyWebView.CoreWebView2.NavigationStarting += CoreWebView2_NavigationStarting;
+            SpotifyWebView.CoreWebView2.NewWindowRequested += CoreWebView2_NewWindowRequested;
+            SpotifyWebView.CoreWebView2.DownloadStarting += (_, args) => args.Cancel = true;
+            SpotifyWebView.CoreWebView2.NavigationCompleted += CoreWebView2_NavigationCompleted;
+            SpotifyWebView.CoreWebView2.Navigate(SpotifyLoginUrl);
+            _cookieTimer.Start();
+            await CheckForSpotifySessionAsync();
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Warn(LogCategory, $"Unable to initialize Spotify login: {ex.Message}");
+            StatusText.Text = Loc.Get("spotifyLogin.failed");
+            StatusText.Foreground = new SolidColorBrush(Color.FromRgb(248, 113, 113));
+        }
+    }
+
+    internal static bool IsAllowedNavigation(string? value) =>
+        Uri.TryCreate(value, UriKind.Absolute, out var uri) &&
+        uri.Scheme == Uri.UriSchemeHttps && uri.Port == 443 && string.IsNullOrEmpty(uri.UserInfo) &&
+        (uri.Host.Equals("spotify.com", StringComparison.OrdinalIgnoreCase) ||
+         uri.Host.EndsWith(".spotify.com", StringComparison.OrdinalIgnoreCase));
+
+    private void CoreWebView2_NavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs args)
+    {
+        if (IsAllowedNavigation(args.Uri)) return;
+        args.Cancel = true;
+        ShowBlockedSignInMessage();
+        // Authentication URLs can contain tokens; do not log the URL.
+        RuntimeLog.Warn(LogCategory, "Blocked navigation outside Spotify.");
+    }
+
+    private void CoreWebView2_NewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs args)
+    {
+        args.Handled = true;
+        if (IsAllowedNavigation(args.Uri)) SpotifyWebView.CoreWebView2.Navigate(args.Uri);
+        else ShowBlockedSignInMessage();
+    }
+
+    private void ShowBlockedSignInMessage()
+    {
+        StatusText.Text = Loc.Get("spotifyLogin.blockedMethod");
+        StatusText.Foreground = new SolidColorBrush(Color.FromRgb(248, 113, 113));
+    }
+
+    private async void CoreWebView2_NavigationCompleted(
+        object? sender,
+        CoreWebView2NavigationCompletedEventArgs e)
+    {
+        await CheckForSpotifySessionAsync();
+    }
+
+    private async void CookieTimer_Tick(object? sender, EventArgs e)
+    {
+        await CheckForSpotifySessionAsync();
+    }
+
+    private async Task CheckForSpotifySessionAsync()
+    {
+        if (_webViewDisposed || _isClosing || _cookieCheckInProgress || SpotifyWebView.CoreWebView2 == null)
+            return;
+
+        _cookieCheckInProgress = true;
+        try
+        {
+            IReadOnlyList<CoreWebView2Cookie> cookies =
+                await SpotifyWebView.CoreWebView2.CookieManager.GetCookiesAsync(SpotifyCookieUrl);
+            CoreWebView2Cookie? session = cookies.FirstOrDefault(cookie =>
+                cookie.Name.Equals("sp_dc", StringComparison.Ordinal) &&
+                !string.IsNullOrWhiteSpace(cookie.Value));
+            if (session == null)
+                return;
+
+            SpotifySpDc = session.Value;
+            _cookieTimer.Stop();
+            StatusText.Text = Loc.Get("spotifyLogin.connected");
+            CloseWithAnimation(true);
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Debug(LogCategory, () => $"Spotify cookie check failed: {ex.Message}");
+        }
+        finally
+        {
+            _cookieCheckInProgress = false;
+        }
+    }
+
+    private void CancelButton_Click(object sender, RoutedEventArgs e)
+    {
+        CloseWithAnimation(false);
+    }
+
+    private void DisposeWebViewOnce()
+    {
+        if (_webViewDisposed) return;
+        _webViewDisposed = true;
+        try
+        {
+            if (SpotifyWebView.CoreWebView2 != null)
+            {
+                SpotifyWebView.CoreWebView2.NavigationCompleted -= CoreWebView2_NavigationCompleted;
+                SpotifyWebView.CoreWebView2.NavigationStarting -= CoreWebView2_NavigationStarting;
+                SpotifyWebView.CoreWebView2.NewWindowRequested -= CoreWebView2_NewWindowRequested;
+                try
+                {
+                    SpotifyWebView.CoreWebView2.CookieManager.DeleteAllCookies();
+                }
+                catch (Exception ex)
+                {
+                    RuntimeLog.Debug(LogCategory, () => $"Failed to delete cookies: {ex.Message}");
+                }
+            }
+            SpotifyWebView.Dispose();
+        }
+        catch (Exception ex)
+        {
+            RuntimeLog.Warn(LogCategory, $"Error during WebView2 disposal: {ex.Message}");
+        }
+    }
+
+    private void Window_Closed(object? sender, EventArgs e)
+    {
+        _isClosing = true;
+        _privacyCancellation.Dispose();
+        _cookieTimer.Stop();
+        _cookieTimer.Tick -= CookieTimer_Tick;
+        _cookieTimer.Dispose();
+        DisposeWebViewOnce();
+
+        IDisposable? cleanupLease = System.Threading.Interlocked.Exchange(ref _profileCleanupLease, null);
+        string? userDataFolder = System.Threading.Interlocked.Exchange(ref _userDataFolder, null);
+        if (userDataFolder != null)
+            DeleteTemporaryProfileAsync(userDataFolder, cleanupLease).SafeFireAndForget("SPOTIFY-LOGIN-CLEANUP");
+        else
+            cleanupLease?.Dispose();
+    }
+
+    private static async Task DeleteTemporaryProfileAsync(string userDataFolder, IDisposable? cleanupLease)
+    {
+        try
+        {
+            for (int attempt = 0; attempt < 10; attempt++)
+            {
+                try
+                {
+                    if (Directory.Exists(userDataFolder))
+                        SafeFileDeletion.DeleteDirectory(userDataFolder);
+                    return;
+                }
+                catch (IOException)
+                {
+                    await Task.Delay(150).ConfigureAwait(false);
+                }
+                catch (UnauthorizedAccessException)
+                {
+                    await Task.Delay(150).ConfigureAwait(false);
+                }
+            }
+        }
+        finally
+        {
+            cleanupLease?.Dispose();
+        }
+    }
+
+    private void TitleBar_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.LeftButton == MouseButtonState.Pressed)
+        {
+            DragMove();
+        }
+    }
+
+    private void WindowSurface_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (e.LeftButton != MouseButtonState.Pressed)
+        {
+            return;
+        }
+
+        if (IsInteractiveElement(e.OriginalSource as DependencyObject))
+        {
+            return;
+        }
+
+        DragMove();
+    }
+
+    private static bool IsInteractiveElement(DependencyObject? source)
+    {
+        while (source != null)
+        {
+            if (source is System.Windows.Controls.Primitives.ButtonBase or System.Windows.Controls.Primitives.ScrollBar)
+            {
+                return true;
+            }
+            if (source.GetType().FullName == "Microsoft.Web.WebView2.Wpf.WebView2")
+            {
+                return true;
+            }
+            source = VisualTreeHelper.GetParent(source);
+        }
+        return false;
+    }
+
+    private bool _isClosing;
+    private bool? _dialogResultToSet;
+
+    private void PlayEntranceAnimation()
+    {
+        var easeOut = new ExponentialEase { EasingMode = EasingMode.EaseOut, Exponent = 6 };
+        int fps = VNotch.Services.AnimationConfig.TargetFps;
+        var duration = TimeSpan.FromMilliseconds(450);
+
+        var fade = new DoubleAnimation(0.0, 1.0, duration) { EasingFunction = easeOut };
+        Timeline.SetDesiredFrameRate(fade, fps);
+        MainShell.BeginAnimation(OpacityProperty, fade);
+
+        var scaleX = new DoubleAnimation(0.95, 1.0, duration) { EasingFunction = easeOut };
+        Timeline.SetDesiredFrameRate(scaleX, fps);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleXProperty, scaleX);
+
+        var scaleY = new DoubleAnimation(0.95, 1.0, duration) { EasingFunction = easeOut };
+        Timeline.SetDesiredFrameRate(scaleY, fps);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, scaleY);
+
+        var translateY = new DoubleAnimation(8.0, 0.0, duration) { EasingFunction = easeOut };
+        Timeline.SetDesiredFrameRate(translateY, fps);
+        ShellTranslate.BeginAnimation(TranslateTransform.YProperty, translateY);
+    }
+
+    private void CloseWithAnimation(bool? result)
+    {
+        if (_isClosing) return;
+        _isClosing = true;
+        _dialogResultToSet = result;
+
+        var easeIn = new ExponentialEase { EasingMode = EasingMode.EaseIn, Exponent = 6 };
+        int fps = VNotch.Services.AnimationConfig.TargetFps;
+        var duration = TimeSpan.FromMilliseconds(400);
+
+        var fade = new DoubleAnimation(MainShell.Opacity, 0.0, duration) { EasingFunction = easeIn };
+        Timeline.SetDesiredFrameRate(fade, fps);
+
+        fade.Completed += (s, e) =>
+        {
+            RuntimeLog.Debug(LogCategory, () => "Exit animation completed. Setting DialogResult.");
+            try
+            {
+                if (_dialogResultToSet == true)
+                {
+                    DialogResult = true;
+                }
+                else if (_dialogResultToSet == false)
+                {
+                    DialogResult = false;
+                }
+                else
+                {
+                    Close();
+                }
+            }
+            catch (Exception ex)
+            {
+                RuntimeLog.Warn(LogCategory, $"Error during animated close: {ex.Message}");
+                Close();
+            }
+        };
+
+        MainShell.BeginAnimation(OpacityProperty, fade);
+
+        var scaleX = new DoubleAnimation(ShellScale.ScaleX, 0.95, duration) { EasingFunction = easeIn };
+        Timeline.SetDesiredFrameRate(scaleX, fps);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleXProperty, scaleX);
+
+        var scaleY = new DoubleAnimation(ShellScale.ScaleY, 0.95, duration) { EasingFunction = easeIn };
+        Timeline.SetDesiredFrameRate(scaleY, fps);
+        ShellScale.BeginAnimation(ScaleTransform.ScaleYProperty, scaleY);
+
+        var translateY = new DoubleAnimation(ShellTranslate.Y, 8.0, duration) { EasingFunction = easeIn };
+        Timeline.SetDesiredFrameRate(translateY, fps);
+        ShellTranslate.BeginAnimation(TranslateTransform.YProperty, translateY);
+    }
+
+    protected override void OnClosing(System.ComponentModel.CancelEventArgs e)
+    {
+        if (!_isClosing)
+        {
+            e.Cancel = true;
+            CloseWithAnimation(DialogResult);
+        }
+        else
+        {
+            base.OnClosing(e);
+        }
+    }
+}
+

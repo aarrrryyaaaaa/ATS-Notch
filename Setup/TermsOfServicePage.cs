@@ -1,0 +1,408 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Reflection;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Documents;
+using System.Windows.Input;
+using System.Windows.Media;
+using VNotch.Controls;
+using VNotch.Services;
+
+namespace VNotch;
+
+public class TermsOfServicePage : UserControl, ISetupAnimatedPage
+{
+    private readonly TextBlock _headline;
+    private readonly TextBlock _description;
+    private readonly Border _termsBorder;
+    private readonly ScrollViewer _termsScrollViewer;
+    private readonly StackPanel _termsContentPanel;
+    private readonly Grid _footerPanel;
+    private readonly TextBlock _statusText;
+    private readonly CheckBox _agreeCheckBox;
+
+    private bool _hasReadToBottom;
+    private string _currentLoadedLanguage = string.Empty;
+
+    private static readonly FontFamily SFProBold = SetupFonts.SFProDisplayFont;
+
+    private static readonly SolidColorBrush BrushWhite = Freeze(new SolidColorBrush(VNotch.Services.UiPalette.PrimaryColor));
+    private static readonly SolidColorBrush BrushDimWhite = Freeze(new SolidColorBrush(Color.FromRgb(173, 173, 173)));
+    private static readonly SolidColorBrush BrushMuted = Freeze(new SolidColorBrush(Color.FromRgb(140, 149, 158)));
+    private static readonly SolidColorBrush BrushGreen = Freeze(new SolidColorBrush(Color.FromArgb(255, 48, 209, 88)));
+    private static readonly SolidColorBrush BrushContainerBg = Freeze(new SolidColorBrush(Color.FromRgb(8, 8, 8)));
+    private static readonly SolidColorBrush BrushContainerBorder = Freeze(new SolidColorBrush(Color.FromRgb(36, 36, 36)));
+
+    private static SolidColorBrush Freeze(SolidColorBrush b) { b.Freeze(); return b; }
+
+    public bool HasReadToBottom => _hasReadToBottom;
+    public bool CanContinue => _hasReadToBottom && _agreeCheckBox.IsChecked == true;
+    public event Action<bool>? CanContinueChanged;
+
+    public ScrollViewer TermsScrollViewer => _termsScrollViewer;
+    public CheckBox AgreeCheckBox => _agreeCheckBox;
+
+    public TermsOfServicePage()
+    {
+        TextOptions.SetTextFormattingMode(this, TextFormattingMode.Ideal);
+        TextOptions.SetTextRenderingMode(this, TextRenderingMode.ClearType);
+        TextOptions.SetTextHintingMode(this, TextHintingMode.Fixed);
+
+        var mainGrid = new Grid();
+        mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        mainGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        // Row 0: Headline
+        _headline = new TextBlock
+        {
+            Text = Loc.Get("setup.terms.headline"),
+            FontSize = 24,
+            LineHeight = 30,
+            FontWeight = FontWeights.Bold,
+            Foreground = BrushWhite,
+            FontFamily = SFProBold,
+            Margin = new Thickness(0, 0, 0, 10),
+            TextWrapping = TextWrapping.Wrap
+        };
+        Grid.SetRow(_headline, 0);
+        mainGrid.Children.Add(_headline);
+
+        // Row 1: Description
+        _description = new TextBlock
+        {
+            Text = Loc.Get("setup.terms.description"),
+            FontSize = 13.5,
+            FontWeight = FontWeights.Bold,
+            LineHeight = 20,
+            Foreground = BrushDimWhite,
+            FontFamily = SFProBold,
+            Margin = new Thickness(0, 0, 0, 16),
+            TextWrapping = TextWrapping.Wrap
+        };
+        Grid.SetRow(_description, 1);
+        mainGrid.Children.Add(_description);
+
+        // Row 2: Terms scroll container
+        _termsBorder = new Border
+        {
+            Background = BrushContainerBg,
+            BorderBrush = BrushContainerBorder,
+            BorderThickness = new Thickness(1),
+            CornerRadius = new CornerRadius(18),
+            Padding = new Thickness(22, 18, 14, 18),
+            ClipToBounds = true
+        };
+
+        _termsScrollViewer = new ScrollViewer
+        {
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            Focusable = true,
+            Background = Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(0, 0, 8, 0)
+        };
+        _termsScrollViewer.ScrollChanged += TermsScrollViewer_ScrollChanged;
+        _termsScrollViewer.PanningMode = PanningMode.VerticalOnly;
+        System.Windows.Automation.AutomationProperties.SetName(_termsScrollViewer, Loc.Get("setup.terms.headline"));
+
+        _termsContentPanel = new StackPanel
+        {
+            Orientation = Orientation.Vertical
+        };
+        _termsScrollViewer.Content = _termsContentPanel;
+        _termsBorder.Child = _termsScrollViewer;
+
+        Grid.SetRow(_termsBorder, 2);
+        mainGrid.Children.Add(_termsBorder);
+
+        // Row 3: Footer controls (Status and Agreement CheckBox)
+        _footerPanel = new Grid
+        {
+            Margin = new Thickness(0, 12, 0, 0)
+        };
+        _footerPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        _footerPanel.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+        // Row 0: Reading status
+        _statusText = new TextBlock
+        {
+            FontSize = 13,
+            FontWeight = FontWeights.Bold,
+            FontFamily = SFProBold,
+            VerticalAlignment = VerticalAlignment.Center,
+            TextWrapping = TextWrapping.Wrap
+        };
+        Grid.SetRow(_statusText, 0);
+        _footerPanel.Children.Add(_statusText);
+
+        // Row 1: Agreement CheckBox
+        _agreeCheckBox = new CheckBox
+        {
+            Content = Loc.Get("setup.terms.checkbox"),
+            FontSize = 13,
+            FontWeight = FontWeights.Bold,
+            FontFamily = SFProBold,
+            Foreground = BrushWhite,
+            Margin = new Thickness(0, 16, 0, 0),
+            IsEnabled = false,
+            Cursor = Cursors.Hand
+        };
+        var agreementText = new FrameworkElementFactory(typeof(TextBlock));
+        agreementText.SetBinding(TextBlock.TextProperty, new System.Windows.Data.Binding());
+        agreementText.SetValue(TextBlock.TextWrappingProperty, TextWrapping.Wrap);
+        agreementText.SetValue(TextBlock.LineHeightProperty, 20.0);
+        agreementText.SetValue(TextBlock.FontWeightProperty, FontWeights.Bold);
+        agreementText.SetValue(TextBlock.FontFamilyProperty, SFProBold);
+        _agreeCheckBox.ContentTemplate = new DataTemplate { VisualTree = agreementText };
+        _agreeCheckBox.Checked += AgreeCheckBox_CheckedChanged;
+        _agreeCheckBox.Unchecked += AgreeCheckBox_CheckedChanged;
+        Grid.SetRow(_agreeCheckBox, 1);
+        _footerPanel.Children.Add(_agreeCheckBox);
+
+        Grid.SetRow(_footerPanel, 3);
+        mainGrid.Children.Add(_footerPanel);
+
+        Content = mainGrid;
+
+        LoadAndRenderTerms(Loc.CurrentLanguage);
+        UpdateStatusUi();
+    }
+
+    public IReadOnlyList<UIElement> GetAnimatedElements()
+    {
+        return new UIElement[] { _headline, _description, _termsBorder, _footerPanel };
+    }
+
+    public void RefreshLocalization()
+    {
+        _headline.Text = Loc.Get("setup.terms.headline");
+        System.Windows.Automation.AutomationProperties.SetName(_termsScrollViewer, _headline.Text);
+        _description.Text = Loc.Get("setup.terms.description");
+        _agreeCheckBox.Content = Loc.Get("setup.terms.checkbox");
+
+        var currentLang = Loc.CurrentLanguage;
+        if (_currentLoadedLanguage != currentLang)
+        {
+            LoadAndRenderTerms(currentLang);
+        }
+
+        UpdateStatusUi();
+    }
+
+    private void TermsScrollViewer_ScrollChanged(object sender, ScrollChangedEventArgs e)
+    {
+        CheckIfScrolledToBottom();
+    }
+
+    public void CheckIfScrolledToBottom()
+    {
+        if (_hasReadToBottom)
+        {
+            return;
+        }
+
+        // The page is constructed before it is displayed. Before layout, both
+        // extent and scrollable height are zero; that does not mean it was read.
+        if (!IsMeasureValid || !IsArrangeValid ||
+            !_termsScrollViewer.IsMeasureValid || !_termsScrollViewer.IsArrangeValid ||
+            _termsScrollViewer.ViewportHeight <= 0 || _termsScrollViewer.ExtentHeight <= 0)
+        {
+            return;
+        }
+
+        // If content fits completely without scroll
+        if (_termsScrollViewer.ScrollableHeight <= 0)
+        {
+            MarkAsReadToBottom();
+            return;
+        }
+
+        // Allow only sub-pixel rounding, not an unread final line.
+        if (_termsScrollViewer.VerticalOffset >= _termsScrollViewer.ScrollableHeight - 1)
+        {
+            MarkAsReadToBottom();
+        }
+    }
+
+    private void MarkAsReadToBottom()
+    {
+        if (_hasReadToBottom)
+        {
+            return;
+        }
+
+        _hasReadToBottom = true;
+        _agreeCheckBox.IsEnabled = true;
+        _agreeCheckBox.IsChecked = true;
+        UpdateStatusUi();
+        CanContinueChanged?.Invoke(CanContinue);
+    }
+
+    private void AgreeCheckBox_CheckedChanged(object sender, RoutedEventArgs e)
+    {
+        CanContinueChanged?.Invoke(CanContinue);
+    }
+
+    private void UpdateStatusUi()
+    {
+        if (_hasReadToBottom)
+        {
+            _statusText.Text = "✓ " + Loc.Get("setup.terms.scrollCompleted");
+            _statusText.Foreground = BrushGreen;
+        }
+        else
+        {
+            _statusText.Text = "↓ " + Loc.Get("setup.terms.scrollHint");
+            _statusText.Foreground = BrushMuted;
+        }
+    }
+
+    private void LoadAndRenderTerms(string language)
+    {
+        _currentLoadedLanguage = language;
+        _hasReadToBottom = false;
+        _agreeCheckBox.IsChecked = false;
+        _agreeCheckBox.IsEnabled = false;
+        _termsScrollViewer.ScrollToTop();
+        CanContinueChanged?.Invoke(false);
+        string markdown = LoadTermsMarkdown(language);
+        RenderMarkdownToPanel(markdown);
+
+        // Check immediately in case height fits
+        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Loaded, () =>
+        {
+            CheckIfScrolledToBottom();
+        });
+    }
+
+    private static string LoadTermsMarkdown(string language)
+    {
+        bool isVietnamese = string.Equals(language, "vi", StringComparison.OrdinalIgnoreCase);
+        string resourceName = isVietnamese ? "VNotch.TERMS_OF_SERVICE_VI.md" : "VNotch.TERMS_OF_SERVICE.md";
+        string fileName = isVietnamese ? "TERMS_OF_SERVICE_VI.md" : "TERMS_OF_SERVICE.md";
+
+        // 1. Try embedded resource
+        try
+        {
+            var assembly = Assembly.GetExecutingAssembly();
+            using var stream = assembly.GetManifestResourceStream(resourceName);
+            if (stream != null)
+            {
+                using var reader = new StreamReader(stream);
+                return reader.ReadToEnd();
+            }
+        }
+        catch
+        {
+            // Fall through
+        }
+
+        // 2. Try disk file in BaseDirectory, parent, or docs/ subdirectories
+        try
+        {
+            var baseDir = AppContext.BaseDirectory;
+            var localPath = Path.Combine(baseDir, fileName);
+            if (File.Exists(localPath))
+            {
+                return File.ReadAllText(localPath);
+            }
+
+            var localDocPath = Path.Combine(baseDir, "docs", fileName);
+            if (File.Exists(localDocPath))
+            {
+                return File.ReadAllText(localDocPath);
+            }
+
+            var parentDir = Directory.GetParent(baseDir)?.FullName;
+            if (parentDir != null)
+            {
+                var parentPath = Path.Combine(parentDir, fileName);
+                if (File.Exists(parentPath))
+                {
+                    return File.ReadAllText(parentPath);
+                }
+
+                var parentDocPath = Path.Combine(parentDir, "docs", fileName);
+                if (File.Exists(parentDocPath))
+                {
+                    return File.ReadAllText(parentDocPath);
+                }
+            }
+        }
+        catch
+        {
+            // Fall through
+        }
+
+        // 3. Fallback text
+        return GetFallbackTermsMarkdown(isVietnamese);
+    }
+
+    internal static string GetFallbackTermsMarkdown(bool isVietnamese)
+    {
+        return isVietnamese
+            ? "# ATS-Notch - Ketentuan Penggunaan\n\nATS-Notch dikembangkan oleh aarrrryyaaaaa (github.com/aarrrryyaaaaa/ATS-Notch). Aplikasi berjalan secara lokal tanpa telemetri. Fitur jaringan opsional hanya aktif ketika Anda mengizinkannya."
+            : "# ATS-Notch - Terms of Use\n\nATS-Notch is developed by aarrrryyaaaaa (github.com/aarrrryyaaaaa/ATS-Notch). The application runs locally without telemetry. Optional network features connect only when explicitly enabled.";
+    }
+
+    private static readonly SolidColorBrush BrushRule = Freeze(new SolidColorBrush(Color.FromArgb(30, 255, 255, 255)));
+    private static readonly MarkdownPanelOptions TermsMarkdownOptions = new()
+    {
+        BodyFont = SFProBold,
+        InlineCodeFont = new FontFamily("Consolas"),
+        BodyFontSize = 13,
+        BodyLineHeight = 22,
+        BodyFontWeight = FontWeights.Bold,
+        ParagraphMargin = new Thickness(0, 0, 0, 12),
+        SoftBreakAsSpace = true,
+        BodyForeground = BrushDimWhite,
+        HeadingForeground = BrushWhite,
+        ResolveHeadingStyle = static level => level switch
+        {
+            1 => (18.0, FontWeights.Bold, new Thickness(0, 4, 0, 10)),
+            2 => (15.0, FontWeights.Bold, new Thickness(0, 24, 0, 8)),
+            3 => (13.5, FontWeights.Bold, new Thickness(0, 16, 0, 6)),
+            _ => (13.0, FontWeights.Bold, new Thickness(0, 12, 0, 4))
+        },
+        ListTextForeground = BrushDimWhite,
+        BulletForeground = BrushWhite,
+        OrderedMarkerForeground = BrushMuted,
+        CheckedTaskForeground = BrushGreen,
+        UncheckedTaskForeground = BrushMuted,
+        ListItemMargin = new Thickness(0, 0, 0, 8),
+        BulletColumnWidth = 14,
+        MarkerColumnWidth = 20,
+        QuoteBorderBrush = BrushContainerBorder,
+        QuoteForeground = BrushMuted,
+        QuotePadding = new Thickness(12, 4, 0, 4),
+        QuoteMargin = new Thickness(0, 0, 0, 10),
+        ThematicBreakBrush = BrushRule,
+        ThematicBreakMargin = new Thickness(0, 10, 0, 10),
+        InlineCodeForeground = BrushWhite,
+        InlineCodeBackground = null,
+        TableHeaderForeground = BrushWhite,
+        TableCellForeground = BrushDimWhite,
+        TableBorderBrush = BrushContainerBorder,
+        BoldForeground = BrushWhite,
+        ItalicForeground = BrushDimWhite,
+        LinkForeground = BrushWhite,
+        UnderlineLinks = true,
+        HttpsOnlyLinks = true
+    };
+
+    private void RenderMarkdownToPanel(string markdown)
+    {
+        RenderMarkdownToPanel(_termsContentPanel, markdown);
+    }
+
+    internal static void RenderMarkdownToPanel(StackPanel targetPanel, string markdown) =>
+        MarkdownWpfRenderer.RenderToPanel(targetPanel, markdown, TermsMarkdownOptions);
+
+    internal static void AddFormattedInlines(TextBlock textBlock, string text) =>
+        MarkdownWpfRenderer.PopulateInlines(textBlock.Inlines, text, TermsMarkdownOptions, clearFirst: false);
+}

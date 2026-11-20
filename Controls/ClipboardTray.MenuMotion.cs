@@ -1,0 +1,133 @@
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
+using System.Windows.Input;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Threading;
+using VNotch.Services;
+
+namespace VNotch.Controls;
+
+public sealed partial class ClipboardTray
+{
+    private readonly Dictionary<FrameworkElement, object> _pendingMenuEntrances = [];
+    private readonly Dictionary<ContextMenu, FrameworkElement> _menuAnimationTargets = [];
+    private static bool MenuKeyboardInput => InputManager.Current.MostRecentInputDevice is KeyboardDevice;
+
+    private void QueueMenuEntrance(FrameworkElement surface, FrameworkElement? target, Func<bool> isOpen, bool fresh, bool submenu = false)
+    {
+        if (MenuKeyboardInput || AnimationConfig.ReduceMotion || !AnimationConfig.ClientAreaAnimation)
+        {
+            _pendingMenuEntrances.Remove(surface);
+            ResetMenuSurface(surface);
+            return;
+        }
+        var request = new object();
+        _pendingMenuEntrances[surface] = request;
+        if (fresh)
+        {
+            surface.BeginAnimation(OpacityProperty, null);
+            surface.Opacity = 0;
+        }
+        // Wait for popup placement and its first layout. Starting earlier changes
+        // the scale origin after the first visible frame and makes the panel jump.
+        Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(() =>
+        {
+            if (!_pendingMenuEntrances.TryGetValue(surface, out var current) || !ReferenceEquals(current, request)) return;
+            _pendingMenuEntrances.Remove(surface);
+            if (!_disposed && isOpen()) AnimateMenuSurface(surface, target, fresh, submenu);
+        }));
+    }
+
+    private void CancelMenuEntrance(FrameworkElement surface)
+    {
+        _pendingMenuEntrances.Remove(surface);
+        ResetMenuSurface(surface);
+    }
+
+    private static void ConfigureMenuDismissal(Popup popup)
+    {
+        // Native fade releases capture and disables hit testing immediately, then
+        // retains the popup window just long enough to finish its dismissal.
+        popup.PopupAnimation = !AnimationConfig.ReduceMotion && AnimationConfig.ClientAreaAnimation && !MenuKeyboardInput
+            ? PopupAnimation.Fade : PopupAnimation.None;
+    }
+
+    internal static void AnimateMenuSurface(FrameworkElement surface, FrameworkElement? target, bool fresh, bool submenu = false)
+    {
+        if (MenuKeyboardInput || AnimationConfig.ReduceMotion || !AnimationConfig.ClientAreaAnimation)
+        {
+            ResetMenuSurface(surface);
+            return;
+        }
+        bool anchored = target != null;
+        Point anchor = fresh ? MenuAnchor(surface, target) : surface.RenderTransformOrigin;
+        double scale = anchored ? .95 : submenu ? .98 : .96;
+        double x = anchored ? (anchor.X <= .5 ? -6 : 6) : (anchor.X - .5) * 6;
+        double y = anchored ? (anchor.Y <= .5 ? -4 : 4) : (anchor.Y - .5) * 6;
+        MenuSurfaceSpring.Open(surface, anchor, scale, x, y, fresh);
+    }
+
+    private static Point MenuAnchor(FrameworkElement surface, FrameworkElement? target)
+    {
+        // Resolve after placement so menus flipped above/left of the trigger still
+        // grow from the correct edge, including across displays with different DPI.
+        if (target == null || surface.ActualWidth <= 0 || surface.ActualHeight <= 0 ||
+            PresentationSource.FromVisual(surface) == null || PresentationSource.FromVisual(target) == null)
+            return new Point(0, 0.05);
+        try
+        {
+            Point trigger = target.PointToScreen(new Point(target.ActualWidth / 2, target.ActualHeight / 2));
+            Point anchor = surface.PointFromScreen(trigger);
+            return new Point(Math.Clamp(anchor.X / surface.ActualWidth, 0, 1), Math.Clamp(anchor.Y / surface.ActualHeight, 0, 1));
+        }
+        catch (InvalidOperationException)
+        {
+            return new Point(0, 0.05);
+        }
+    }
+
+    internal static DoubleAnimation MenuAnimation(double from, double to, int duration, IEasingFunction? easing = null)
+    {
+        var animation = new DoubleAnimation(from, to, TimeSpan.FromMilliseconds(duration))
+        {
+            EasingFunction = easing ?? TrayMotion.EaseOut,
+            FillBehavior = FillBehavior.Stop
+        };
+        Timeline.SetDesiredFrameRate(animation, AnimationConfig.TargetFps);
+        return animation;
+    }
+
+    private static void ResetMenuSurface(FrameworkElement surface)
+    {
+        MenuSurfaceSpring.Reset(surface);
+    }
+
+    private void Submenu_Opened(object sender, EventArgs e)
+    {
+        if (sender is not Popup { Child: FrameworkElement child } popup) return;
+        if (popup.TemplatedParent is MenuItem item && item.Template.FindName("SubmenuSurface", item) is FrameworkElement surface)
+            QueueMenuEntrance(surface, popup.PlacementTarget as FrameworkElement, () => popup.IsOpen,
+                surface.RenderTransform is not TransformGroup, submenu: true);
+        ConfigureMenuDismissal(popup);
+        EnsureMenuTopmost(child);
+    }
+
+    private void Submenu_Closed(object sender, EventArgs e)
+    {
+        if (sender is not Popup popup) return;
+        if (popup.TemplatedParent is MenuItem item && item.Template.FindName("SubmenuSurface", item) is FrameworkElement surface)
+            CancelMenuEntrance(surface);
+        popup.PopupAnimation = PopupAnimation.None;
+    }
+
+    private void MenuItem_Pressed(object sender, RoutedEventArgs e) => SetMenuRowOpacity(sender, 0.7);
+    private void MenuItem_Released(object sender, RoutedEventArgs e) => SetMenuRowOpacity(sender, 1);
+
+    private static void SetMenuRowOpacity(object sender, double opacity)
+    {
+        if (sender is MenuItem item && item.Template?.FindName("MenuRow", item) is Border row)
+            TrayMotion.SetOpacity(row, opacity);
+    }
+}
