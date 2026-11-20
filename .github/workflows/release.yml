@@ -1,0 +1,190 @@
+name: Release ATS-Notch
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build & Publish Release
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Determine release metadata
+        id: meta
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.tag }}' } else { '${{ github.ref_name }}' }
+          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+          $ver = $tag.TrimStart('v')
+          if ($ver -match '^(\d+)\.(\d+)\.(\d+)') {
+            $verFull = "$($Matches[1]).$($Matches[2]).$($Matches[3]).0"
+          } else {
+            $verFull = "1.0.0.0"
+          }
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ver=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "ver_full=$verFull" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Publish Self-Contained app & uninstaller
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.ver }}
+          APP_VERSION_FULL: ${{ steps.meta.outputs.ver_full }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet publish ATS-Notch.csproj -c Release -r win-x64 --self-contained true -p:SkipNativeCompile=true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:DebugType=none -p:DebugSymbols=false "-p:Version=$($env:APP_VERSION)" "-p:AssemblyVersion=$($env:APP_VERSION_FULL)" "-p:FileVersion=$($env:APP_VERSION_FULL)" "-p:InformationalVersion=$($env:APP_VERSION)" -o dist/self-contained
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish Uninstall/Uninstall.csproj -c Release -r win-x64 -p:SelfContained=true -o dist/uninstall-sc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath 'dist/uninstall-sc/uninstall.exe' -Destination 'dist/self-contained/uninstall.exe' -Force
+
+      - name: Publish Framework-Dependent app & uninstaller
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.ver }}
+          APP_VERSION_FULL: ${{ steps.meta.outputs.ver_full }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          dotnet publish ATS-Notch.csproj -c Release -r win-x64 --self-contained false -p:SkipNativeCompile=true -p:PublishSingleFile=true -p:DebugType=none -p:DebugSymbols=false "-p:Version=$($env:APP_VERSION)" "-p:AssemblyVersion=$($env:APP_VERSION_FULL)" "-p:FileVersion=$($env:APP_VERSION_FULL)" "-p:InformationalVersion=$($env:APP_VERSION)" -o dist/portable
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          dotnet publish Uninstall/Uninstall.csproj -c Release -r win-x64 -p:SelfContained=false -o dist/uninstall-fd
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build Windows Installer (.exe) & Portable ZIP
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          APP_VERSION: ${{ steps.meta.outputs.ver }}
+          APP_VERSION_FULL: ${{ steps.meta.outputs.ver_full }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+
+          # Package portable ZIP first (before copying uninstall.exe into dist/portable for installer staging)
+          $portZip = "release-assets/ATS-Notch-$($env:RELEASE_TAG)-win-x64-Portable.zip"
+          Compress-Archive -Path 'dist/portable/*' -DestinationPath $portZip -Force
+
+          # Stage uninstaller for framework-dependent NSIS installer
+          Copy-Item -LiteralPath 'dist/uninstall-fd/uninstall.exe' -Destination 'dist/portable/uninstall.exe' -Force
+
+          # Resolve NSIS makensis.exe (pinned toolchain first, fallback to runner preinstalled NSIS)
+          $makensis = $null
+          try {
+            $out = & .\scripts\Initialize-Nsis.ps1 -CacheDirectory nsis-cache -DestinationDirectory nsis-tools
+            $candidate = ($out | Select-Object -Last 1).Trim()
+            if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+              $makensis = $candidate
+            }
+          } catch {
+            Write-Warning "Pinned NSIS download unavailable ($($_.Exception.Message)); falling back to preinstalled NSIS."
+          }
+          if (-not $makensis) {
+            foreach ($path in @(
+              'C:\Program Files (x86)\NSIS\makensis.exe',
+              'C:\Program Files\NSIS\makensis.exe'
+            )) {
+              if (Test-Path -LiteralPath $path -PathType Leaf) { $makensis = $path; break }
+            }
+          }
+          if (-not $makensis) {
+            $cmd = Get-Command makensis.exe -ErrorAction SilentlyContinue
+            if ($cmd) { $makensis = $cmd.Source }
+          }
+          if (-not $makensis) { throw 'NSIS makensis.exe could not be located.' }
+          Write-Host "Using NSIS compiler: $makensis"
+
+          $setupSc = "release-assets\ATS-Notch-Setup-SelfContained.exe"
+          $setupFd = "release-assets\ATS-Notch-Setup.exe"
+
+          & $makensis /V2 `
+            "/DAPP_VERSION_FULL=$($env:APP_VERSION_FULL)" `
+            "/DAPP_VERSION=$($env:APP_VERSION)" `
+            /DSELF_CONTAINED=1 `
+            "/DAPP_BUILD_DIR=dist\self-contained" `
+            "/DOUT_FILE=$setupSc" `
+            ATS-Notch-Setup.nsi
+          if ($LASTEXITCODE -ne 0) { throw "NSIS Self-Contained installer build failed ($LASTEXITCODE)." }
+
+          & $makensis /V2 `
+            "/DAPP_VERSION_FULL=$($env:APP_VERSION_FULL)" `
+            "/DAPP_VERSION=$($env:APP_VERSION)" `
+            "/DAPP_BUILD_DIR=dist\portable" `
+            "/DOUT_FILE=$setupFd" `
+            ATS-Notch-Setup.nsi
+          if ($LASTEXITCODE -ne 0) { throw "NSIS Standard installer build failed ($LASTEXITCODE)." }
+
+          foreach ($f in @($setupSc, $setupFd, $portZip)) {
+            if (-not (Test-Path -LiteralPath $f -PathType Leaf)) { throw "Missing expected asset: $f" }
+          }
+
+          $lines = @()
+          foreach ($file in @($setupSc, $setupFd, $portZip)) {
+            $hash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            $name = Split-Path -Leaf $file
+            $lines += "$hash  $name"
+            if ($name.EndsWith('.exe')) {
+              "$hash  $name" | Set-Content -Path "release-assets/$name.sha256" -Encoding utf8
+            }
+          }
+          $lines -join "`n" | Set-Content -Path 'release-assets/SHA256SUMS.txt' -Encoding utf8
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          RELEASES_REPO_TOKEN: ${{ secrets.RELEASES_REPO_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.tag }}
+          TARGET_REPO: aarrrryyaaaaa/ATS-Notch-Releases
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notes = @"
+          ## ATS-Notch $($env:RELEASE_TAG)
+
+          Rilis resmi **ATS-Notch** untuk Windows 10 & Windows 11 (64-bit).
+
+          ### Pilihan Unduhan
+          - **``ATS-Notch-Setup-SelfContained.exe``** *(Disarankan — Installer Lengkap)* — Tinggal jalankan installer, tanpa perlu install .NET 8 Runtime terlebih dahulu.
+          - **``ATS-Notch-Setup.exe``** *(Installer Ringan)* — Ukuran lebih kecil, otomatis mengecek & membantu menginstal .NET 8 Desktop Runtime jika belum terpasang.
+          - **``ATS-Notch-$($env:RELEASE_TAG)-win-x64-Portable.zip``** *(Portable)* — Ekstrak dan jalankan langsung tanpa instalasi (butuh .NET 8 Desktop Runtime).
+          - **``SHA256SUMS.txt``** — Checksum verifikasi file rilis.
+          "@
+          $notes | Set-Content -Path 'release-notes.md' -Encoding utf8
+
+          if (-not [string]::IsNullOrWhiteSpace($env:RELEASES_REPO_TOKEN)) {
+            $env:GH_TOKEN = $env:RELEASES_REPO_TOKEN
+            $repo = $env:TARGET_REPO
+          } else {
+            $env:GH_TOKEN = $env:GITHUB_TOKEN
+            $repo = '${{ github.repository }}'
+          }
+          Write-Host "Publishing release $($env:RELEASE_TAG) to $repo"
+
+          gh release view $env:RELEASE_TAG --repo $repo *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release delete $env:RELEASE_TAG --repo $repo --yes
+          }
+          gh release create $env:RELEASE_TAG release-assets/* `
+            --repo $repo `
+            --title "ATS-Notch $($env:RELEASE_TAG)" `
+            --notes-file release-notes.md `
+            --latest

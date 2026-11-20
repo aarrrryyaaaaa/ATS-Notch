@@ -1,0 +1,497 @@
+﻿param(
+    # Use -Clean to force a full rebuild (e.g. when BAML/animations are suspected stale).
+    # Defaults to a fast incremental build.
+    [switch]$Clean
+)
+
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
+$ErrorActionPreference = "Continue"
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+# Suppress background console window popups & dotnet startup overhead
+$env:GIT_TERMINAL_PROMPT = "0"
+$env:GCM_INTERACTIVE = "never"
+$env:DOTNET_NOLOGO = "1"
+$env:DOTNET_CLI_TELEMETRY_OPTOUT = "1"
+$env:DOTNET_SKIP_FIRST_TIME_EXPERIENCE = "1"
+$env:Path = ($env:Path -split ";" | Where-Object { $_ -ne "C:\Program Files\Git\mingw64\bin" }) -join ";"
+
+# --- Configuration ---------------------------------------------------------
+$repoRoot    = Split-Path $PSScriptRoot -Parent
+$processName   = "V-Notch"
+$csprojPath    = Join-Path $repoRoot "V-Notch.csproj"
+$objPath       = Join-Path $repoRoot "obj\Debug\net8.0-windows10.0.19041.0\win-x64"
+$nativeObjPath = Join-Path $repoRoot "obj\native"
+$binPath       = Join-Path $repoRoot "bin\Debug\net8.0-windows10.0.19041.0\win-x64"
+$exePath       = [IO.Path]::GetFullPath((Join-Path $binPath "V-Notch.exe"))
+$nativeDllPath = Join-Path $binPath "VNotch.Native.dll"
+
+$version = "dev"
+if (Test-Path $csprojPath) {
+    try {
+        [xml]$projXml = Get-Content -LiteralPath $csprojPath -Raw
+        $parsedVer = $projXml.Project.PropertyGroup.Version | Where-Object { $_ } | Select-Object -First 1
+        if ($parsedVer) { $version = "v$parsedVer" }
+    } catch { }
+}
+
+# --- Runtime Unicode Glyphs (7-bit ASCII source safe for PS 5.1 & PS 7) ----
+$gTopLeft     = [char]0x256D # ╭
+$gBotLeft     = [char]0x2570 # ╰
+$gVert        = [char]0x2502 # │
+$gBranch      = [char]0x251C # ├
+$gHoriz       = [char]0x2500 # ─
+$gDiamond     = [char]0x25C6 # ◆
+$gDot         = [char]0x25CF # ●
+$gCheck       = [char]0x2714 # ✔
+$gCross       = [char]0x2716 # ✖
+$gWarn        = [char]0x25B2 # ▲
+$gArrow       = [char]0x25B8 # ▸
+
+$lineRule     = ([string]$gHoriz) * 56
+
+function Write-TreeHeader {
+    $modeText  = if ($Clean) { "Full Rebuild (-Clean)" } else { "Fast Incremental" }
+    $modeColor = if ($Clean) { "Yellow" } else { "Green" }
+
+    Write-Host ""
+    Write-Host "  $gTopLeft$lineRule" -ForegroundColor DarkCyan
+    Write-Host "  $gVert  " -ForegroundColor DarkCyan -NoNewline
+    Write-Host "$gDiamond V-NOTCH DEV RUNNER " -ForegroundColor Cyan -NoNewline
+    Write-Host $version -ForegroundColor DarkGray -NoNewline
+    Write-Host "  $gVert  " -ForegroundColor DarkGray -NoNewline
+    Write-Host $modeText -ForegroundColor $modeColor
+    Write-Host "  $gVert" -ForegroundColor DarkCyan
+}
+
+function Write-TreeStep {
+    param(
+        [string]$StepTag,
+        [string]$Title
+    )
+    Write-Host "  $gBranch$gHoriz " -ForegroundColor DarkCyan -NoNewline
+    Write-Host "[$StepTag] " -ForegroundColor Cyan -NoNewline
+    Write-Host $Title -ForegroundColor White
+}
+
+function Write-TreeItem {
+    param(
+        [string]$Message,
+        [ValidateSet("Info", "Success", "Warn", "Error")]
+        [string]$State = "Info"
+    )
+    switch ($State) {
+        "Info"    { $sym = $gArrow; $sCol = "DarkCyan"; $tCol = "Gray" }
+        "Success" { $sym = $gCheck; $sCol = "Green";    $tCol = "Gray" }
+        "Warn"    { $sym = $gWarn;  $sCol = "Yellow";   $tCol = "Yellow" }
+        "Error"   { $sym = $gCross; $sCol = "Red";      $tCol = "Red" }
+    }
+    Write-Host "  $gVert     " -ForegroundColor DarkCyan -NoNewline
+    Write-Host "$sym " -ForegroundColor $sCol -NoNewline
+    Write-Host $Message -ForegroundColor $tCol
+}
+
+function Write-TreeSpacer {
+    Write-Host "  $gVert" -ForegroundColor DarkCyan
+}
+
+$totalSteps = if ($Clean) { 4 } else { 3 }
+$stepIndex  = 0
+function Next-StepTag {
+    $script:stepIndex++
+    return "$($script:stepIndex)/$totalSteps"
+}
+
+Write-TreeHeader
+
+# --- 1. Stop old instances and WAIT for them to actually exit ---------------
+function Get-VNotchInstances {
+    # The per-user single-instance mutex is shared by installed and dev builds.
+    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $candidates = @(Get-Process -Name $processName -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $sessionId })
+    foreach ($instance in $candidates) {
+        try {
+            $processInfo = Get-CimInstance Win32_Process -Filter "ProcessId = $($instance.Id)" -ErrorAction Stop
+            if (-not $processInfo) { continue }
+            $owner = Invoke-CimMethod -InputObject $processInfo -MethodName GetOwnerSid -ErrorAction Stop
+            if ($owner.ReturnValue -ne 0 -or -not $owner.Sid) {
+                throw 'Could not determine the process owner.'
+            }
+            if ($owner.Sid -eq $userSid) { $instance }
+        } catch {
+            # An instance may exit while its ownership is being queried.
+            if (-not (Get-Process -Id $instance.Id -ErrorAction SilentlyContinue)) { continue }
+            throw "Cannot inspect $processName PID $($instance.Id): $($_.Exception.Message)"
+        }
+    }
+}
+
+function Wait-VNotchExit {
+    param([int]$TimeoutMs = 7000)
+    $deadline = (Get-Date).AddMilliseconds($TimeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        $alive = @(Get-VNotchInstances)
+        if (-not $alive) { return $true }
+        Start-Sleep -Milliseconds 150
+    }
+    return $false
+}
+
+Write-TreeStep (Next-StepTag) "Process Check"
+try {
+    $running = @(Get-VNotchInstances)
+    if ($running.Count -gt 0) {
+        $pids = ($running | Select-Object -ExpandProperty Id) -join ", "
+        Write-TreeItem "Stopping $($running.Count) running instance(s) (PID: $pids)..." -State Info
+        foreach ($instance in $running) {
+            try {
+                if (-not $instance.HasExited) { Stop-Process -InputObject $instance -Force -ErrorAction Stop }
+            } catch {
+                if (-not $instance.HasExited) { throw }
+            }
+        }
+
+        if (-not (Wait-VNotchExit -TimeoutMs 7000)) {
+            throw 'Process still alive after 7s - aborting.'
+        }
+        Write-TreeItem "Terminated cleanly." -State Success
+    } else {
+        Write-TreeItem "No active V-Notch process." -State Success
+    }
+} catch {
+    Write-TreeItem "Cannot stop the previous instance: $($_.Exception.Message)" -State Error
+    Write-Host "  $gBotLeft$lineRule`n" -ForegroundColor DarkCyan
+    exit 1
+}
+
+# --- 2. (Only with -Clean) Hard-delete obj/bin to force a full rebuild -------
+function Remove-Folder-Hard {
+    param([string]$Path, [int]$Retries = 4)
+    if (-not (Test-Path $Path)) { return $true }
+    for ($i = 0; $i -lt $Retries; $i++) {
+        try {
+            Remove-Item $Path -Recurse -Force -ErrorAction Stop
+            return $true
+        } catch {
+            if ($i -eq ($Retries - 1)) {
+                Write-TreeItem "Could not delete $Path : $($_.Exception.Message)" -State Warn
+                return $false
+            }
+            Start-Sleep -Milliseconds 400
+        }
+    }
+    return $false
+}
+
+if ($Clean) {
+    Write-TreeSpacer
+    Write-TreeStep (Next-StepTag) "Clean Cache"
+    $objClean       = Remove-Folder-Hard $objPath
+    $nativeObjClean = Remove-Folder-Hard $nativeObjPath
+    $binClean       = Remove-Folder-Hard $binPath
+
+    if ($objClean -and $nativeObjClean -and $binClean) {
+        Write-TreeItem "Cleared obj, native obj & bin directories (fresh BAML & C++20)." -State Success
+    } else {
+        Write-TreeItem "Partial cleanup - some files were locked." -State Warn
+    }
+}
+
+# --- 3. Build ---------------------------------------------------------------
+Write-TreeSpacer
+$assetsPath        = Join-Path $repoRoot "obj\project.assets.json"
+$lockFilePath      = Join-Path $repoRoot "packages.lock.json"
+$outNativeDllPath  = Join-Path $repoRoot "Native\out\VNotch.Native.dll"
+$binManagedDllPath = Join-Path $binPath "V-Notch.dll"
+$restoreReady      = (Test-Path -LiteralPath $assetsPath) -and (-not (Test-Path -LiteralPath $lockFilePath) -or (Get-Item -LiteralPath $assetsPath).LastWriteTimeUtc -ge (Get-Item -LiteralPath $lockFilePath).LastWriteTimeUtc)
+$useNoRestore      = (-not $Clean -and $restoreReady)
+
+function Get-DevBuildScope {
+    if ($Clean -or -not $useNoRestore) {
+        return @{ Native = $true; Managed = $true; Reason = if ($Clean) { "Full Rebuild" } else { "Incremental + Restore" } }
+    }
+    if (-not [IO.File]::Exists($exePath) -or -not [IO.File]::Exists($binManagedDllPath) -or
+        -not [IO.File]::Exists($nativeDllPath) -or -not [IO.File]::Exists($outNativeDllPath)) {
+        return @{ Native = $true; Managed = $true; Reason = "Incremental --no-restore" }
+    }
+
+    $exeTicks = [IO.File]::GetLastWriteTimeUtc($exePath).Ticks
+    $dllTicks = [IO.File]::GetLastWriteTimeUtc($binManagedDllPath).Ticks
+    $binTicks = [Math]::Min($exeTicks, $dllTicks)
+    $nativeTicks = [IO.File]::GetLastWriteTimeUtc($outNativeDllPath).Ticks
+
+    $nativeChanged = $false
+    $managedChanged = $false
+
+    $csprojTicks = [IO.File]::GetLastWriteTimeUtc($csprojPath).Ticks
+    if ($csprojTicks -gt $nativeTicks) { $nativeChanged = $true }
+    if ($csprojTicks -gt $binTicks) { $managedChanged = $true }
+
+    foreach ($rootFile in @("packages.lock.json", "Package.appxmanifest", "app.manifest", "LICENSE", "Directory.Build.props", "Directory.Build.targets", "global.json")) {
+        $p = Join-Path $repoRoot $rootFile
+        if ([IO.File]::Exists($p) -and [IO.File]::GetLastWriteTimeUtc($p).Ticks -gt $binTicks) {
+            $managedChanged = $true
+        }
+    }
+    foreach ($nativeScript in @("scripts\Generate-GlassShaders.ps1", "scripts\Prepare-VNotchNative.ps1")) {
+        $p = Join-Path $repoRoot $nativeScript
+        if ([IO.File]::Exists($p) -and [IO.File]::GetLastWriteTimeUtc($p).Ticks -gt $nativeTicks) {
+            $nativeChanged = $true
+        }
+    }
+
+    $skipDirs = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($d in @(".git", ".vs", ".cache", ".codegraph", ".github", ".agents", "artifacts", "bin", "obj", "TestResults", "Tests", "Tools", "Uninstall", "Introduction", "scripts")) {
+        $null = $skipDirs.Add($d)
+    }
+    $nativeOutDir = [IO.Path]::GetFullPath((Join-Path $repoRoot "Native\out"))
+    $nativeRootDir = [IO.Path]::GetFullPath((Join-Path $repoRoot "Native"))
+    $shadersRootDir = [IO.Path]::GetFullPath((Join-Path $repoRoot "Shaders"))
+    $toolsShaderDir = [IO.Path]::GetFullPath((Join-Path $repoRoot "Tools\ShaderCompiler"))
+    $stack = [System.Collections.Generic.Stack[IO.DirectoryInfo]]::new()
+    foreach ($dir in ([IO.DirectoryInfo]::new($repoRoot)).GetDirectories()) {
+        if (-not $skipDirs.Contains($dir.Name)) { $stack.Push($dir) }
+    }
+    if ([IO.Directory]::Exists($toolsShaderDir)) {
+        $stack.Push([IO.DirectoryInfo]::new($toolsShaderDir))
+    }
+
+    while ($stack.Count -gt 0 -and (-not $nativeChanged -or -not $managedChanged)) {
+        $cur = $stack.Pop()
+        $full = $cur.FullName
+        if ($full.Equals($nativeOutDir, [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        $isNativeTree = $full.StartsWith($nativeRootDir, [System.StringComparison]::OrdinalIgnoreCase) -or
+                        $full.StartsWith($shadersRootDir, [System.StringComparison]::OrdinalIgnoreCase) -or
+                        $full.StartsWith($toolsShaderDir, [System.StringComparison]::OrdinalIgnoreCase)
+
+        $dirTicks = $cur.LastWriteTimeUtc.Ticks
+        if ($isNativeTree) {
+            if ($dirTicks -gt $nativeTicks) { $nativeChanged = $true }
+        } else {
+            if ($dirTicks -gt $binTicks) { $managedChanged = $true }
+        }
+
+        foreach ($f in $cur.EnumerateFiles()) {
+            $t = $f.LastWriteTimeUtc.Ticks
+            if ($isNativeTree) {
+                if ($t -gt $nativeTicks) { $nativeChanged = $true; break }
+            } else {
+                if ($t -gt $binTicks) { $managedChanged = $true; break }
+            }
+        }
+        foreach ($sub in $cur.EnumerateDirectories()) {
+            if (-not $sub.Name.Equals("bin", [System.StringComparison]::OrdinalIgnoreCase) -and
+                -not $sub.Name.Equals("obj", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $stack.Push($sub)
+            }
+        }
+    }
+
+    $reason = if (-not $nativeChanged -and -not $managedChanged) {
+        "Up-to-date (Fast Skip)"
+    } elseif ($nativeChanged -and -not $managedChanged) {
+        "Native-Only Fast Incremental"
+    } elseif (-not $nativeChanged -and $managedChanged) {
+        "C#/XAML Incremental (SkipNativeCompile)"
+    } else {
+        "Incremental --no-restore"
+    }
+    return @{ Native = $nativeChanged; Managed = $managedChanged; Reason = $reason }
+}
+
+$buildScope = Get-DevBuildScope
+Write-TreeStep (Next-StepTag) "Compile ($($buildScope.Reason))"
+
+$buildSw = [System.Diagnostics.Stopwatch]::StartNew()
+if (-not $buildScope.Native -and -not $buildScope.Managed) {
+    if ([IO.File]::GetLastWriteTimeUtc($outNativeDllPath).Ticks -gt [IO.File]::GetLastWriteTimeUtc($nativeDllPath).Ticks) {
+        [IO.File]::Copy($outNativeDllPath, $nativeDllPath, $true)
+    }
+    $buildSw.Stop()
+    Write-TreeItem ("No changes detected; skipped build in {0:N2}s." -f $buildSw.Elapsed.TotalSeconds) -State Success
+} else {
+    $prevPriority = [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass
+    $buildOutput = @()
+    $buildExitCode = 0
+    try {
+        [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = [System.Diagnostics.ProcessPriorityClass]::BelowNormal
+        if ($buildScope.Native -and -not $buildScope.Managed) {
+            $buildArgs = @(
+                "msbuild", $csprojPath, "-t:BuildNativeDll", "-nologo", "-v:q", "-clp:NoSummary",
+                "-p:Configuration=Debug", "-p:NativeFastCompile=true"
+            )
+            $buildOutput = & dotnet @buildArgs 2>&1
+            $buildExitCode = $LASTEXITCODE
+            if ($buildExitCode -eq 0 -and [IO.File]::Exists($outNativeDllPath)) {
+                [IO.File]::Copy($outNativeDllPath, $nativeDllPath, $true)
+            }
+        } else {
+            # shortcut: skips /GL & /LTCG on dev builds, use scripts/b.ps1 or scripts/c.ps1 for LTCG verification
+            $buildArgs = @(
+                "build", $csprojPath, "-nologo", "-v:q", "-clp:NoSummary", "-m:2",
+                "-p:NativeFastCompile=true", "-p:RunAnalyzers=false",
+                "-p:EnforceCodeStyleInBuild=false", "-p:EnableNETAnalyzers=false",
+                "-p:BuildProjectReferences=false",
+                "-p:CreateHardLinksForCopyFilesToOutputDirectoryIfPossible=true",
+                "-p:CreateHardLinksForCopyLocalIfPossible=true"
+            )
+            if ($useNoRestore) { $buildArgs += "--no-restore" }
+            if (-not $buildScope.Native) { $buildArgs += "-p:SkipNativeCompile=true" }
+            $buildOutput = & dotnet @buildArgs 2>&1
+            $buildExitCode = $LASTEXITCODE
+        }
+    } finally {
+        [System.Diagnostics.Process]::GetCurrentProcess().PriorityClass = $prevPriority
+    }
+    $buildSw.Stop()
+
+    $diagnosticLines = @($buildOutput | ForEach-Object { "$_" } | Where-Object { $_.Trim().Length -gt 0 })
+
+    if ($buildExitCode -ne 0) {
+        Write-TreeItem ("Build failed in {0:N2}s (exit code {1}):" -f $buildSw.Elapsed.TotalSeconds, $buildExitCode) -State Error
+        foreach ($line in $diagnosticLines) {
+            $lineColor = if ($line -match "error\s+[A-Z]+\d+") { "Red" } elseif ($line -match "warning\s+[A-Z]+\d+") { "Yellow" } else { "Gray" }
+            Write-Host "  $gVert       $line" -ForegroundColor $lineColor
+        }
+        Write-Host "  $gBotLeft$lineRule`n" -ForegroundColor DarkCyan
+        exit $buildExitCode
+    }
+
+    foreach ($line in $diagnosticLines) {
+        if ($line -match "warning\s+[A-Z]+\d+") {
+            Write-TreeItem $line.Trim() -State Warn
+        }
+    }
+    if (-not (Test-Path $nativeDllPath)) {
+        Write-TreeItem "VNotch.Native.dll missing from build output directory: $nativeDllPath" -State Error
+        Write-Host "  $gBotLeft$lineRule`n" -ForegroundColor DarkCyan
+        exit 1
+    }
+    Write-TreeItem ("Built V-Notch.dll & VNotch.Native.dll in {0:N2}s." -f $buildSw.Elapsed.TotalSeconds) -State Success
+}
+
+# --- 4. Launch --------------------------------------------------------------
+if (-not ("VNotchDesktopLauncher" -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+
+public static class VNotchDesktopLauncher
+{
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcessW(
+        string lpApplicationName,
+        string lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    public static int StartOnDefaultDesktop(string exePath, string workingDir)
+    {
+        STARTUPINFO si = new STARTUPINFO();
+        si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        si.lpDesktop = @"WinSta0\Default";
+        si.dwFlags = 0x00000001; // STARTF_USESHOWWINDOW
+        si.wShowWindow = 1;     // SW_SHOWNORMAL
+
+        PROCESS_INFORMATION pi;
+        string cmdLine = "\"" + exePath + "\"";
+        if (!CreateProcessW(exePath, cmdLine, IntPtr.Zero, IntPtr.Zero, false, 0, IntPtr.Zero, workingDir, ref si, out pi))
+        {
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        }
+
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return (int)pi.dwProcessId;
+    }
+}
+'@ -ErrorAction SilentlyContinue
+}
+
+Write-TreeSpacer
+Write-TreeStep (Next-StepTag) "Launch Application"
+$sessionSw = [System.Diagnostics.Stopwatch]::StartNew()
+$procId = $null
+try {
+    if (Test-Path $exePath) {
+        $relExe = $exePath.Substring($repoRoot.Length + 1)
+        $workDir = Split-Path $exePath -Parent
+        try {
+            $procId = [VNotchDesktopLauncher]::StartOnDefaultDesktop($exePath, $workDir)
+        } catch {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new($exePath)
+            $psi.UseShellExecute = $false
+            $psi.WorkingDirectory = $workDir
+            $procId = ([System.Diagnostics.Process]::Start($psi)).Id
+        }
+        Write-TreeItem "Binary  : $relExe" -State Info
+        Write-TreeItem "Process : PID $procId (WinSta0\Default)" -State Success
+        Write-TreeSpacer
+        Write-Host "  $gBotLeft$lineRule" -ForegroundColor DarkCyan
+        Write-Host "     " -NoNewline
+        Write-Host "$gDot LIVE " -ForegroundColor Green -NoNewline
+        Write-Host "V-Notch is running. Press " -ForegroundColor Gray -NoNewline
+        Write-Host "Ctrl+C" -ForegroundColor Yellow -NoNewline
+        Write-Host " to stop." -ForegroundColor Gray
+        Write-Host ""
+        Wait-Process -Id $procId
+    } else {
+        Write-TreeItem "Executable missing, running via 'dotnet run --no-build'..." -State Warn
+        Write-Host "  $gBotLeft$lineRule`n" -ForegroundColor DarkCyan
+        dotnet run --project $csprojPath --no-build
+    }
+}
+finally {
+    $sessionSw.Stop()
+    if ($procId) {
+        Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "     " -NoNewline
+    Write-Host "$gCheck STOPPED " -ForegroundColor DarkGray -NoNewline
+    Write-Host ("Session ended cleanly ({0:mm\:ss})." -f $sessionSw.Elapsed) -ForegroundColor DarkGray
+    Write-Host ""
+}

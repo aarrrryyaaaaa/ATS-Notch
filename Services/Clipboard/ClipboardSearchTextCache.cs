@@ -1,0 +1,70 @@
+namespace VNotch.Services.Clipboard;
+
+/// <summary>Thread-safe bounded cache; never persists decrypted Personal text.</summary>
+// UTF-16 payload budget: 4M characters = 8 MiB, excluding small index overhead.
+internal sealed class ClipboardSearchTextCache(int maxCharacters = 4 * 1024 * 1024, int maxEntries = 2048)
+{
+    private readonly object _gate = new();
+    private readonly Dictionary<Guid, (string Text, LinkedListNode<Guid> Node)> _items = [];
+    private readonly LinkedList<Guid> _recent = [];
+    private int _characters;
+
+    internal bool TryGet(Guid id, out string text)
+    {
+        lock (_gate)
+        {
+            if (!_items.TryGetValue(id, out var item)) { text = string.Empty; return false; }
+            _recent.Remove(item.Node);
+            _recent.AddLast(item.Node);
+            text = item.Text;
+            return true;
+        }
+    }
+
+    internal void Set(Guid id, string? text)
+    {
+        lock (_gate)
+        {
+            Remove(id);
+            text ??= string.Empty;
+            if (text.Length > maxCharacters || maxEntries <= 0) return;
+            while (_recent.First is { } first &&
+                (_characters > maxCharacters - text.Length || _items.Count >= maxEntries))
+                Remove(first.Value);
+            _items[id] = (text, _recent.AddLast(id));
+            _characters += text.Length;
+        }
+    }
+
+    internal void Remove(Guid id)
+    {
+        lock (_gate)
+        {
+            if (!_items.Remove(id, out var item)) return;
+            _recent.Remove(item.Node);
+            _characters -= item.Text.Length;
+        }
+    }
+
+    internal void Clear()
+    {
+        lock (_gate)
+        {
+            _items.Clear();
+            _recent.Clear();
+            _characters = 0;
+        }
+    }
+
+    internal void Trim(int characterBudget, int entryBudget)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(characterBudget);
+        ArgumentOutOfRangeException.ThrowIfNegative(entryBudget);
+        lock (_gate)
+        {
+            while (_recent.First is { } first &&
+                (_characters > characterBudget || _items.Count > entryBudget))
+                Remove(first.Value);
+        }
+    }
+}

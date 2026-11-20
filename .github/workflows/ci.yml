@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build ATS-Notch (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+
+      - name: Restore dependencies
+        run: dotnet restore ATS-Notch.csproj
+
+      - name: Publish Release build
+        run: dotnet publish ATS-Notch.csproj -c Release -r win-x64 --self-contained false -p:SkipNativeCompile=true -p:PublishSingleFile=true -o publish-ci --no-restore
+
+      - name: Build test project
+        run: dotnet build Tests/VNotch.Tests.csproj -c Release -p:SkipNativeCompile=true -nologo
+
+      - name: Verify build output
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($f in @('publish-ci/ATS-Notch.exe', 'publish-ci/VNotch.Native.dll', 'publish-ci/logo.ico')) {
+            if (-not (Test-Path -LiteralPath $f)) { throw "Missing build output: $f" }
+          }
+          Write-Host "Build verification succeeded."

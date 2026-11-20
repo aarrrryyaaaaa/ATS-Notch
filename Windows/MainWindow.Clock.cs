@@ -1,0 +1,76 @@
+using System;
+using System.Windows.Input;
+
+namespace VNotch;
+
+public partial class MainWindow
+{
+
+    #region Expanded Widget mode predicates (read by other partials)
+
+    private bool IsClockWidgetMode =>
+        string.Equals(_settings.ExpandedWidget, "clock", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsWordClockWidgetMode =>
+        string.Equals(_settings.ExpandedWidget, "wordclock", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsDigitalClockWidgetMode =>
+        string.Equals(_settings.ExpandedWidget, "digitalclock", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsWeatherWidgetMode =>
+        string.Equals(_settings.ExpandedWidget, "weather", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsSystemMonitorWidgetMode =>
+        string.Equals(_settings.ExpandedWidget, "sysmon", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsAnyClockWidgetMode => IsClockWidgetMode || IsWordClockWidgetMode || IsDigitalClockWidgetMode;
+
+    private bool IsAiUsageWidgetMode =>
+        string.Equals(_settings.ExpandedWidget, "aiusage", StringComparison.OrdinalIgnoreCase);
+
+    private bool IsNonCalendarWidgetMode => IsAnyClockWidgetMode || IsWeatherWidgetMode || IsSystemMonitorWidgetMode || IsAiUsageWidgetMode;
+
+    private bool IsNoWidgetMode => string.Equals(_settings.ExpandedWidget, "none", StringComparison.OrdinalIgnoreCase);
+    private bool ShouldShowMediaBlurBackground => _isLyricsActive;
+    private bool ShouldShowGreetingSection => !IsNoWidgetMode && !_isLyricsActive && (!IsNonCalendarWidgetMode || IsDigitalClockWidgetMode);
+
+    private void ApplyExpandedWidgetMode(bool animateResize = false)
+    {
+        if (_clockWidgetPresenter == null) InitializeClockWidgetPresenter();
+        _clockWidgetPresenter?.ApplyExpandedWidgetMode();
+        if (MediaRightColumn != null)
+            MediaRightColumn.Visibility = IsNoWidgetMode && !_isLyricsActive ? System.Windows.Visibility.Collapsed : System.Windows.Visibility.Visible;
+        EnsureActiveExpandedWidgetFeatureLoaded();
+        SyncExpandedMediaWidth(animate: animateResize);
+        if (ShouldShowMediaBlurBackground)
+            FadeInLyricsBlurBackgroundIfActive();
+        else if (LyricsBlurBackground != null)
+        {
+            _isLyricsBlurFadeInProgress = false;
+            LyricsBlurBackground.BeginAnimation(OpacityProperty, null);
+            LyricsBlurBackground.Opacity = 0;
+            LyricsBlurBackground.Visibility = System.Windows.Visibility.Collapsed;
+        }
+    }
+
+    #endregion
+
+    #region Drag-to-switch widget (XAML-bound handlers → presenter)
+
+    private void CalendarWidget_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+        => _clockWidgetPresenter?.OnCalendarWidgetMouseLeftButtonDown(e);
+
+    private void CalendarWidget_MouseMoveDrag(object sender, MouseEventArgs e)
+    {
+        _clockWidgetPresenter?.OnCalendarWidgetMouseMoveDrag(e);
+        EnsureActiveExpandedWidgetFeatureLoaded();
+    }
+
+    private void CalendarWidget_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
+    {
+        _clockWidgetPresenter?.OnCalendarWidgetMouseLeftButtonUp(e);
+        EnsureActiveExpandedWidgetFeatureLoaded();
+    }
+
+    #endregion
+}

@@ -1,0 +1,768 @@
+using System.Net;
+using System.Net.Http;
+using System.Text.Json;
+using VNotch.Services;
+using Xunit;
+
+namespace VNotch.Tests;
+
+public sealed class MediaMetadataLookupServiceTests
+{
+    [Fact]
+    public async Task SearchRejectsUnrelatedFirstResultsFromEveryProvider()
+    {
+        string id = NewId();
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "www.googleapis.com")
+            {
+                Assert.EndsWith("/search", uri.AbsolutePath);
+                return Json(new { items = new[] { new { id = new { videoId = id }, snippet = new { title = "Unrelated viral podcast", channelTitle = "Host" } } } });
+            }
+            if (uri.Host == "www.youtube.com") return Body("<html>no matching results</html>");
+            if (uri.AbsolutePath == "/search")
+                return Json(new { items = new[] { new { url = "/watch?v=" + id, title = "Unrelated viral podcast", uploaderName = "Host" } } });
+            return Json(new[] { new { videoId = id, title = "Unrelated viral podcast", author = "Host" } });
+        });
+        using var client = new HttpClient(handler);
+        var result = await Service(client, apiKey: "test-key-for-fixtures").TrySearchYouTubeByTitleAsync("Obscure underground track", "Artist");
+        Assert.Null(result);
+        Assert.DoesNotContain(handler.Requests, uri => uri.AbsolutePath is "/oembed" or "/youtube/v3/videos");
+    }
+
+    [Theory]
+    [InlineData("", "Song")]
+    [InlineData("!!!", "Song")]
+    [InlineData("Song", "!!!")]
+    [InlineData(" ", "Song")]
+    public void EmptyNormalizedTitlesCannotMatchUnrelatedVideos(string title, string expected)
+        => Assert.False(new YouTubeLookupResult { Title = title }.TitleMatches(expected));
+
+    [Theory]
+    [InlineData("api")]
+    [InlineData("scrape")]
+    public async Task EnrichmentCannotReplaceAMatchingSearchTitleWithUnrelatedMetadata(string source)
+    {
+        string id = NewId();
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "www.googleapis.com")
+                return uri.AbsolutePath.EndsWith("/search")
+                    ? Json(new { items = new[] { new { id = new { videoId = id }, snippet = new { title = "Requested song" } } } })
+                    : Json(new { items = new[] { new { snippet = new { title = "Unrelated video", channelTitle = "Other artist" }, contentDetails = new { duration = "PT2M" } } } });
+            if (uri.AbsolutePath == "/oembed") return Json(new { title = "Unrelated video", author_name = "Other artist" });
+            if (uri.Host == "www.youtube.com") return Body(source == "scrape"
+                ? "<script>var ytInitialData = {\"videoId\":\"" + id + "\",\"title\":{\"runs\":[{\"text\":\"Requested song\"}]}};</script>"
+                : "<html>no results</html>");
+            return uri.AbsolutePath == "/search" ? Json(new { items = Array.Empty<object>() }) : Json(Array.Empty<object>());
+        });
+        using var client = new HttpClient(handler);
+        Assert.Null(await Service(client, apiKey: source == "api" ? "test-key-for-fixtures" : null)
+            .TrySearchYouTubeByTitleAsync("Requested song"));
+    }
+
+    [Theory]
+    [InlineData("api")]
+    [InlineData("scrape")]
+    [InlineData("piped")]
+    [InlineData("invidious")]
+    public async Task SearchRejectsUnrelatedResultsWithoutEnrichingOrCachingThem(string source)
+    {
+        string id = NewId();
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.AbsolutePath == "/oembed") return Json(new { title = "Actual video title", author_name = "Actual artist" });
+            if (uri.Host == "www.googleapis.com")
+                return uri.AbsolutePath.EndsWith("/search")
+                    ? Json(new { items = new[] { new { id = new { videoId = id }, snippet = new { title = "Unrelated result", channelTitle = "Other artist" } } } })
+                    : Json(new { items = Array.Empty<object>() });
+            if (uri.Host == "www.youtube.com")
+                return Body(source == "scrape"
+                    ? "<script>var ytInitialData = {\"videoId\":\"" + id + "\",\"title\":{\"runs\":[{\"text\":\"Unrelated result\"}]}};</script>"
+                    : "<html>no results</html>");
+            if (uri.AbsolutePath == "/search")
+                return source == "piped"
+                    ? Json(new { items = new[] { new { url = "/watch?v=" + id, title = "Unrelated result" } } })
+                    : Json(new { items = Array.Empty<object>() });
+            return source == "invidious"
+                ? Json(new[] { new { videoId = id, title = "Unrelated result" } })
+                : Json(Array.Empty<object>());
+        });
+        using var client = new HttpClient(handler);
+        var service = Service(client, apiKey: source == "api" ? "test-key-for-fixtures" : null);
+        Assert.Null(await service.TrySearchYouTubeByTitleAsync("Requested song", "Requested artist"));
+        Assert.DoesNotContain(handler.Requests, uri => uri.AbsolutePath is "/oembed" or "/youtube/v3/videos");
+        var actual = await service.TryGetYouTubeVideoIdWithInfoAsync(id);
+        Assert.Equal("Actual video title", actual?.Title);
+        Assert.Contains(handler.Requests, uri => uri.AbsolutePath == "/oembed");
+    }
+
+    [Theory]
+    [InlineData("https://www.youtube.com/watch?v={0}")]
+    [InlineData("https://youtu.be/{0}")]
+    [InlineData("https://music.youtube.com/watch?v={0}")]
+    [InlineData("https://www.youtube.com/embed/{0}")]
+    [InlineData("https://www.youtube.com/v/{0}")]
+    public async Task VideoUrlsResolveMetadataAndReuseCachedResults(string format)
+    {
+        string id = NewId();
+        using var handler = new Handler(_ => Json(new { title = "Test song", author_name = "Test artist" }));
+        using var client = new HttpClient(handler);
+        var service = Service(client);
+        string url = string.Format(format, id);
+        var result = await service.TryGetYouTubeVideoInfoFromUrlAsync(url);
+        Assert.NotNull(result);
+        Assert.Equal(id, result.Id);
+        Assert.Equal("Test song", result.Title);
+        Assert.Equal("Test artist", result.Author);
+        Assert.Equal(YouTubeLookupSource.OEmbed, result.Source);
+        Assert.Same(result, await service.TryGetYouTubeVideoInfoFromUrlAsync(url));
+        Assert.Single(handler.Requests);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData("https://example.invalid/watch?v=abcdefghijk")]
+    [InlineData("https://youtu.be/short")]
+    public async Task InvalidUrlsAndOfflineSearchDoNotSendRequests(string url)
+    {
+        using var handler = new Handler(_ => throw new InvalidOperationException("Unexpected request"));
+        using var client = new HttpClient(handler);
+        var service = Service(client, allowed: false);
+        Assert.Null(await service.TryGetYouTubeVideoInfoFromUrlAsync(url));
+        Assert.Null(await service.TryGetYouTubeVideoIdWithInfoAsync("Test song"));
+        Assert.Null(await service.TrySearchYouTubeByTitleAsync("Test song"));
+        Assert.Null(await service.TryGetSoundCloudArtworkUrlAsync("Test song"));
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task DataApiMetadataIncludesDurationAndTheBestThumbnailAndSendsTheKeyOnlyInTheHeader()
+    {
+        string id = NewId();
+        using var handler = new Handler(request =>
+        {
+            Assert.Equal("www.googleapis.com", request.RequestUri!.Host);
+            Assert.Equal("test-key-for-fixtures", Assert.Single(request.Headers.GetValues("x-goog-api-key")));
+            Assert.DoesNotContain("test-key", request.RequestUri.Query);
+            return Json(new
+            {
+                items = new[] { new { snippet = new { title = "Test song", channelTitle = "Test artist",
+                    thumbnails = new { @default = new { url = "https://example.invalid/small.jpg" },
+                        maxres = new { url = "https://example.invalid/large.jpg" } } },
+                    contentDetails = new { duration = "PT3M42S" } } }
+            });
+        });
+        using var client = new HttpClient(handler);
+        var result = await Service(client, apiKey: "test-key-for-fixtures").TryGetYouTubeVideoIdWithInfoAsync(id);
+        Assert.NotNull(result);
+        Assert.Equal(YouTubeLookupSource.DataApi, result.Source);
+        Assert.Equal(TimeSpan.FromSeconds(222), result.Duration);
+        Assert.Equal("https://example.invalid/large.jpg", result.ThumbnailUrl);
+        Assert.Single(handler.Requests);
+    }
+
+    [Theory]
+    [InlineData("empty")]
+    [InlineData("malformed")]
+    [InlineData("error")]
+    public async Task FailedDataApiFallsBackToOEmbedWhenDurationEnrichmentAlsoFails(string failure)
+    {
+        string id = NewId();
+        using var handler = new Handler(request =>
+        {
+            if (request.RequestUri!.Host == "www.youtube.com")
+                return Json(new { title = "Fallback song", author_name = "Fallback artist" });
+            return failure switch
+            {
+                "empty" => Json(new { items = Array.Empty<object>() }),
+                "malformed" => Body("invalid json"),
+                _ => new HttpResponseMessage(HttpStatusCode.BadGateway) { Content = new StringContent("temporary failure") }
+            };
+        });
+        using var client = new HttpClient(handler);
+        var result = await Service(client, apiKey: "test-key-for-fixtures").TryGetYouTubeVideoIdWithInfoAsync(id);
+        Assert.NotNull(result);
+        Assert.Equal("Fallback song", result.Title);
+        Assert.Equal(TimeSpan.Zero, result.Duration);
+        Assert.Equal(YouTubeLookupSource.OEmbed, result.Source);
+        Assert.Collection(handler.Requests,
+            uri =>
+            {
+                Assert.Equal("www.googleapis.com", uri.Host);
+                Assert.Equal("/youtube/v3/videos", uri.AbsolutePath);
+                Assert.Contains("part=snippet,contentDetails", uri.Query);
+            },
+            uri => Assert.Equal("/oembed", uri.AbsolutePath),
+            uri =>
+            {
+                Assert.Equal("www.googleapis.com", uri.Host);
+                Assert.Equal("/youtube/v3/videos", uri.AbsolutePath);
+                Assert.Contains("part=contentDetails", uri.Query);
+            });
+    }
+
+    [Fact]
+    public async Task FailedDataApiFallsBackToOEmbedAndCachesEnrichedDuration()
+    {
+        string id = NewId();
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.AbsolutePath == "/oembed")
+                return Json(new { title = "Fallback song", author_name = "Fallback artist" });
+            return uri.Query.Contains("part=snippet,contentDetails", StringComparison.Ordinal)
+                ? Json(new { items = Array.Empty<object>() })
+                : Json(new { items = new[] { new { contentDetails = new { duration = "PT3M42S" } } } });
+        });
+        using var client = new HttpClient(handler);
+        var service = Service(client, apiKey: "test-key-for-fixtures");
+
+        var result = await service.TryGetYouTubeVideoIdWithInfoAsync(id);
+
+        Assert.NotNull(result);
+        Assert.Equal("Fallback song", result.Title);
+        Assert.Equal("Fallback artist", result.Author);
+        Assert.Equal(TimeSpan.FromSeconds(222), result.Duration);
+        Assert.Equal(YouTubeLookupSource.OEmbed, result.Source);
+        Assert.Equal(3, handler.Requests.Count);
+        Assert.Same(result, await service.TryGetYouTubeVideoIdWithInfoAsync(id));
+        Assert.Equal(3, handler.Requests.Count);
+    }
+
+    [Fact]
+    public async Task ScrapeParsesVideoRendererWithLongThumbnailListAndJsonEscapes()
+    {
+        string id = NewId();
+        string longThumbnails = new string('x', 1100);
+        string ytJson =
+            "{\"contents\":{\"videoRenderer\":{\"videoId\":\"" + id + "\"," +
+            "\"thumbnail\":{\"thumbnails\":[{\"url\":\"https://i.ytimg.com/vi/" + id + "/" + longThumbnails + ".jpg\",\"width\":1280,\"height\":720}]}," +
+            "\"title\":{\"runs\":[{\"text\":\"Rock \\u0026 Roll \\\"Live\\\" &amp; Loud\"}]}," +
+            "\"longBylineText\":{\"runs\":[{\"text\":\"Band \\u0026 Crew\"}]}}}}";
+
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.AbsolutePath == "/oembed")
+                return new HttpResponseMessage(HttpStatusCode.BadGateway);
+            if (uri.Host == "www.youtube.com")
+                return Body("<script>var ytInitialData = " + ytJson + ";</script>");
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        using var client = new HttpClient(handler);
+        var service = Service(client);
+        var result = await service.TrySearchYouTubeByTitleAsync("Rock & Roll \"Live\" & Loud", "Band & Crew");
+        Assert.NotNull(result);
+        Assert.Equal(id, result.Id);
+        Assert.Equal("Rock & Roll \"Live\" & Loud", result.Title);
+        Assert.Equal("Band & Crew", result.Author);
+    }
+
+    [Theory]
+    [InlineData("api")]
+    [InlineData("scrape")]
+    [InlineData("alternate-scrape")]
+    [InlineData("piped")]
+    [InlineData("invidious")]
+    public async Task SearchResolvesMetadataFromEachFallback(string source)
+    {
+        string id = NewId();
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "www.googleapis.com")
+            {
+                if (uri.AbsolutePath.EndsWith("/search"))
+                    return Json(new { items = new[] { new { id = new { videoId = id }, snippet = new { title = "Test song", channelTitle = "Artist" } } } });
+                return Json(new { items = new[] { new { snippet = new { title = "Test song", channelTitle = "Artist" }, contentDetails = new { duration = "PT2M" } } } });
+            }
+            if (uri.AbsolutePath == "/oembed") return Json(new { title = "Test song", author_name = "Artist" });
+            if (uri.Host == "www.youtube.com")
+            {
+                string prefix = source == "alternate-scrape" ? "window[\"ytInitialData\"] = " : "var ytInitialData = ";
+                string data = "{\"videoId\":\"" + id + "\",\"title\":{\"runs\":[{\"text\":\"Test song\"}]},\"ownerText\":{\"runs\":[{\"text\":\"Artist\"}]}}";
+                return Body(source.Contains("scrape") ? "<script>" + prefix + data + ";</script>" : "<html>no results</html>");
+            }
+            if (uri.AbsolutePath == "/search")
+                return source == "piped" ? Json(new { items = new[] { new { url = "/watch?v=" + id, title = "Test song", uploaderName = "Artist", duration = 120, thumbnail = "https://example.invalid/art.jpg" } } }) : Json(new { items = Array.Empty<object>() });
+            return Json(new[] { new { videoId = id, title = "Test song", author = "Artist", lengthSeconds = 120 } });
+        });
+        using var client = new HttpClient(handler);
+        var service = Service(client, apiKey: source == "api" ? "test-key-for-fixtures" : null);
+        var result = await service.TrySearchYouTubeByTitleAsync("Test song", "Artist");
+        Assert.NotNull(result);
+        Assert.Equal(id, result.Id);
+        Assert.Equal("Test song", result.Title);
+        Assert.Equal("Artist", result.Author);
+        Assert.Equal(source == "api" ? YouTubeLookupSource.DataApi : YouTubeLookupSource.OEmbed, result.Source);
+        if (source is "api" or "piped" or "invidious") Assert.Equal(TimeSpan.FromMinutes(2), result.Duration);
+    }
+
+    [Theory]
+    [InlineData("direct")]
+    [InlineData("search")]
+    public async Task SoundCloudUsesTheArtworkUrlReturnedByOEmbed(string mode)
+    {
+        using var handler = new Handler(request => request.RequestUri!.AbsolutePath == "/oembed"
+            ? Json(new { title = "Test song", author_name = "Artist", thumbnail_url = "https://i1.sndcdn.com/artworks-test-large.jpg" })
+            : Body("<a href=\"/artist/test-song\">Test song</a><a href=\"/artist/test-song\">duplicate</a>"));
+        using var client = new HttpClient(handler);
+        var service = Service(client);
+        string? result = mode == "direct"
+            ? await service.TryGetSoundCloudArtworkFromUrlAsync("https://soundcloud.com/artist/test-song")
+            : await service.TryGetSoundCloudArtworkUrlAsync("Test song", "Artist", requireStrongMatch: true);
+        Assert.Equal("https://i1.sndcdn.com/artworks-test-large.jpg", result);
+        Assert.Equal(mode == "direct" ? 1 : 3, handler.Requests.Count);
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("invalid json")]
+    [InlineData("{}")]
+    public async Task InvalidAndMissingOEmbedDataReturnsNoArtwork(string body)
+    {
+        using var handler = new Handler(_ => Body(body));
+        using var client = new HttpClient(handler);
+        var service = Service(client);
+        Assert.Null(await service.TryGetSoundCloudArtworkFromUrlAsync("https://soundcloud.com/artist/test-song"));
+        Assert.Null(await service.TryGetSoundCloudArtworkUrlAsync("Test song", "Artist"));
+    }
+
+    [Fact]
+    public async Task RequestFailuresAndCancellationReturnNoMetadata()
+    {
+        using var handler = new Handler(_ => throw new HttpRequestException("fixture network failure"));
+        using var client = new HttpClient(handler);
+        var service = Service(client);
+        Assert.Null(await service.TryGetYouTubeVideoIdWithInfoAsync(NewId()));
+        Assert.Null(await service.TrySearchYouTubeByTitleAsync("Test song"));
+        Assert.Null(await service.TryGetSoundCloudArtworkUrlAsync("Test song"));
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+        Assert.Null(await service.TryGetYouTubeVideoIdWithInfoAsync(NewId(), ct: cancelled.Token));
+        Assert.Null(await service.TryGetYouTubeVideoInfoFromUrlAsync($"https://www.youtube.com/watch?v={NewId()}", cancelled.Token));
+        Assert.Null(await service.TryGetSoundCloudArtworkFromUrlAsync("https://soundcloud.com/artist/test-song", cancelled.Token));
+        Assert.Null(await service.TrySearchYouTubeByTitleAsync("Test song", ct: cancelled.Token));
+
+        using var cancelMidFlightHandler = new Handler(_ => throw new OperationCanceledException());
+        using var cancelMidFlightClient = new HttpClient(cancelMidFlightHandler);
+        var cancelMidFlightService = Service(cancelMidFlightClient);
+        Assert.Null(await cancelMidFlightService.TryGetYouTubeVideoIdWithInfoAsync(NewId()));
+        Assert.Null(await cancelMidFlightService.TryGetYouTubeVideoInfoFromUrlAsync($"https://www.youtube.com/watch?v={NewId()}"));
+        Assert.Null(await cancelMidFlightService.TryGetSoundCloudArtworkFromUrlAsync("https://soundcloud.com/artist/test-song"));
+    }
+
+    [Fact]
+    public async Task SoundCloudUrlLookupRespectsOfflineGateAndRejectsMismatchedTrackOrNavigationUrl()
+    {
+        using var offlineHandler = new Handler(_ => throw new InvalidOperationException("Unexpected request"));
+        using var offlineClient = new HttpClient(offlineHandler);
+        var offlineService = Service(offlineClient, allowed: false);
+        Assert.Null(await offlineService.TryGetSoundCloudArtworkFromUrlAsync("https://soundcloud.com/artist/song"));
+        Assert.Empty(offlineHandler.Requests);
+
+        using var handler = new Handler(_ => Json(new
+        {
+            title = "Different Song by Different Artist",
+            author_name = "Different Artist",
+            thumbnail_url = "https://i1.sndcdn.com/artworks-valid-t500x500.jpg"
+        }));
+        using var client = new HttpClient(handler);
+        var service = Service(client, allowed: true);
+
+        Assert.Null(await service.TryGetSoundCloudArtworkFromUrlAsync("https://soundcloud.com/you/likes"));
+        Assert.Empty(handler.Requests);
+
+        Assert.Null(await service.TryGetSoundCloudArtworkFromUrlAsync(
+            "https://soundcloud.com/artist/song",
+            expectedTitle: "Expected Track",
+            expectedArtist: "Expected Artist"));
+        Assert.Single(handler.Requests);
+    }
+
+    [Theory]
+    [InlineData("NO POLE ULTIMATE 2", "NV So Lit")]
+    [InlineData("NO POLE ULTIMATE", "Other uploader")]
+    [InlineData(null, null)]
+    public async Task SoundCloudBrowserUrlMustIdentifyThePlayingTrack(string? title, string? author)
+    {
+        using var handler = new Handler(_ => Json(new
+        {
+            title,
+            author_name = author,
+            thumbnail_url = "https://i1.sndcdn.com/artworks-wrong-large.jpg"
+        }));
+        using var client = new HttpClient(handler);
+        Assert.Null(await Service(client).TryGetSoundCloudArtworkFromUrlAsync(
+            "https://soundcloud.com/nv-so-lit/no-pole-ultimate-2", "NO POLE ULTIMATE", "NV So Lit"));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SoundCloudSearchChoosesTheOriginalInsteadOfASimilarlyNamedVersion(bool strict)
+    {
+        const string html = "<a href='/nv-so-lit/no-pole-ultimate-2'>Sequel</a>" +
+            "<a href='/nv-so-lit/no-pole-ultimate-remix'>Remix</a>" +
+            "<a href='/nv-so-lit/no-pole-ultimate-sped-up'>Sped up</a>" +
+            "<a href='/nv-so-lit/no-pole-ultimate'>Original</a>";
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.AbsolutePath != "/oembed") return Body(html);
+            string trackUrl = Uri.UnescapeDataString(uri.Query);
+            bool original = trackUrl.EndsWith("/no-pole-ultimate", StringComparison.Ordinal);
+            return Json(new
+            {
+                title = original ? "NO POLE ULTIMATE by NV So Lit" : "NO POLE ULTIMATE 2 by NV So Lit",
+                author_name = "NV So Lit",
+                thumbnail_url = original ? "https://i1.sndcdn.com/artworks-original-large.jpg" : "https://i1.sndcdn.com/artworks-wrong-large.jpg"
+            });
+        });
+        using var client = new HttpClient(handler);
+        Assert.Equal("https://i1.sndcdn.com/artworks-original-large.jpg",
+            await Service(client).TryGetSoundCloudArtworkUrlAsync("NO POLE ULTIMATE", "NV So Lit", strict));
+    }
+
+    [Fact]
+    public async Task SpotifyFullArtistsResolvesItunesCollaboratorsAndPreservesAmpersandGroups()
+    {
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "itunes.apple.com")
+            {
+                return Json(new
+                {
+                    results = new[]
+                    {
+                        new { trackName = "Lối Chơi (Interlude)", artistName = "Wren Evans & itsnk", trackTimeMillis = 142589L }
+                    }
+                });
+            }
+            return Json(new { data = Array.Empty<object>() });
+        });
+        using var client = new HttpClient(handler);
+        string? artists = await Service(client).TryGetSpotifyFullArtistsAsync(
+            "Lối Chơi (Interlude)", "Wren Evans", TimeSpan.FromMilliseconds(142589));
+        Assert.Equal("Wren Evans, itsnk", artists);
+
+        string? groupFormatted = MediaMetadataLookupService.FormatSpotifyArtistsCandidate(
+            "Leave The Door Open", "Silk Sonic, Bruno Mars & Anderson .Paak", 242000,
+            "Leave The Door Open", "Bruno Mars & Anderson .Paak", 242000, out int groupScore);
+        Assert.True(groupScore > 0);
+        Assert.Equal("Silk Sonic, Bruno Mars & Anderson .Paak", groupFormatted);
+    }
+
+    [Fact]
+    public async Task SpotifyFullArtistsFallsBackToDeezerContributorsWhenItunesEmpty()
+    {
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "itunes.apple.com")
+                return Json(new { results = Array.Empty<object>() });
+            if (uri.Host == "api.deezer.com" && uri.AbsolutePath == "/search")
+                return Json(new { data = new[] { new { id = 2586071872L, title = "Lối Chơi (Interlude)", duration = 142L } } });
+            if (uri.Host == "api.deezer.com" && uri.AbsolutePath == "/track/2586071872")
+                return Json(new
+                {
+                    id = 2586071872L,
+                    title = "Lối Chơi (Interlude)",
+                    contributors = new[] { new { name = "Wren Evans" }, new { name = "itsnk" } }
+                });
+            return Json(new { });
+        });
+        using var client = new HttpClient(handler);
+        string? artists = await Service(client).TryGetSpotifyFullArtistsAsync(
+            "Lối Chơi (Interlude)", "Wren Evans", TimeSpan.FromSeconds(142));
+        Assert.Equal("Wren Evans, itsnk", artists);
+    }
+
+    [Fact]
+    public async Task SpotifyFullArtistsExtractsParentheticalFeatAndRejectsRemixMismatch()
+    {
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "itunes.apple.com")
+            {
+                return Json(new
+                {
+                    results = new[]
+                    {
+                        new { trackName = "hai triệu năm (feat. Biên) [Madihu mix]", artistName = "Đen & Madihu", trackTimeMillis = 209735L },
+                        new { trackName = "Hai Triệu Năm (feat. Biên)", artistName = "Đen", trackTimeMillis = 216472L }
+                    }
+                });
+            }
+            return Json(new { data = Array.Empty<object>() });
+        });
+        using var client = new HttpClient(handler);
+        string? artists = await Service(client).TryGetSpotifyFullArtistsAsync(
+            "Hai Triệu Năm", "Đen", TimeSpan.FromMilliseconds(216472));
+        Assert.Equal("Đen, Biên", artists);
+    }
+
+    [Fact]
+    public async Task SpotifyFullArtistsResolvesExactArtistsFromSpotifyPathfinderCatalog()
+    {
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "open.spotify.com" && uri.AbsolutePath.EndsWith("/server-time"))
+                return Json(new { serverTime = 1700000000 });
+            if (uri.Host == "open.spotify.com" && uri.AbsolutePath.EndsWith("/token"))
+                return Json(new { accessToken = "anon-token", accessTokenExpirationTimestampMs = 4102444800000L, isAnonymous = true });
+            if (uri.Host == "api-partner.spotify.com" && uri.AbsolutePath.EndsWith("/pathfinder/v2/query"))
+            {
+                return Json(new
+                {
+                    data = new
+                    {
+                        searchV2 = new
+                        {
+                            tracksV2 = new
+                            {
+                                items = new[]
+                                {
+                                    new
+                                    {
+                                        item = new
+                                        {
+                                            data = new
+                                            {
+                                                __typename = "Track",
+                                                id = "6rhPfrew3JeBBVL4iVMOAt",
+                                                name = "Hai Triệu Năm",
+                                                artists = new
+                                                {
+                                                    items = new[]
+                                                    {
+                                                        new { profile = new { name = "Đen" } },
+                                                        new { profile = new { name = "Biên" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    },
+                                    new
+                                    {
+                                        item = new
+                                        {
+                                            data = new
+                                            {
+                                                __typename = "Track",
+                                                id = "5DjJXl38Qz413nIMbnDYYh",
+                                                name = "hai triệu năm - Madihu mix",
+                                                artists = new
+                                                {
+                                                    items = new[]
+                                                    {
+                                                        new { profile = new { name = "Đen" } },
+                                                        new { profile = new { name = "Madihu" } },
+                                                        new { profile = new { name = "Biên" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        using var client = new HttpClient(handler);
+        string? artists = await Service(client).TryGetSpotifyFullArtistsAsync(
+            "Hai Triệu Năm", "Đen", TimeSpan.FromSeconds(216));
+        Assert.Equal("Đen, Biên", artists);
+    }
+
+    [Fact]
+    public async Task SpotifyFullArtistsDisambiguatesIdenticalTrackTitlesUsingAlbumAndFirstArtist()
+    {
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "open.spotify.com" && uri.AbsolutePath.EndsWith("/server-time"))
+                return Json(new { serverTime = 1700000000 });
+            if (uri.Host == "open.spotify.com" && uri.AbsolutePath.EndsWith("/token"))
+                return Json(new { accessToken = "anon-token", accessTokenExpirationTimestampMs = 4102444800000L, isAnonymous = true });
+            if (uri.Host == "api-partner.spotify.com" && uri.AbsolutePath.EndsWith("/pathfinder/v2/query"))
+            {
+                return Json(new
+                {
+                    data = new
+                    {
+                        searchV2 = new
+                        {
+                            tracksV2 = new
+                            {
+                                items = new[]
+                                {
+                                    // Wrong primary artist order (Low G first instead of Đen)
+                                    new
+                                    {
+                                        item = new
+                                        {
+                                            data = new
+                                            {
+                                                __typename = "Track",
+                                                id = "1111111111111111111111",
+                                                name = "Hai Triệu Năm",
+                                                albumOfTrack = new { name = "Hai Triệu Năm" },
+                                                artists = new { items = new[] { new { profile = new { name = "Low G" } }, new { profile = new { name = "Đen" } } } }
+                                            }
+                                        }
+                                    },
+                                    // Same title, different album
+                                    new
+                                    {
+                                        item = new
+                                        {
+                                            data = new
+                                            {
+                                                __typename = "Track",
+                                                id = "2222222222222222222222",
+                                                name = "Hai Triệu Năm",
+                                                albumOfTrack = new { name = "Show Của Đen" },
+                                                artists = new { items = new[] { new { profile = new { name = "Đen" } }, new { profile = new { name = "Khách Mời Live" } } } }
+                                            }
+                                        }
+                                    },
+                                    // Same title, exact matching album from SMTC
+                                    new
+                                    {
+                                        item = new
+                                        {
+                                            data = new
+                                            {
+                                                __typename = "Track",
+                                                id = "6rhPfrew3JeBBVL4iVMOAt",
+                                                name = "Hai Triệu Năm",
+                                                albumOfTrack = new { name = "Hai Triệu Năm" },
+                                                artists = new { items = new[] { new { profile = new { name = "Đen" } }, new { profile = new { name = "Biên" } } } }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            return new HttpResponseMessage(HttpStatusCode.NotFound);
+        });
+        using var client = new HttpClient(handler);
+        string? artists = await Service(client).TryGetSpotifyFullArtistsAsync(
+            "Hai Triệu Năm", "Đen", TimeSpan.FromSeconds(216), albumTitle: "Hai Triệu Năm");
+        Assert.Equal("Đen, Biên", artists);
+
+        // Also verify C++ FormatSpotifyArtists rejects extended titles like "Hai Triệu Năm 2" or "Hai Triệu Năm (Live)"
+        Assert.Null(MediaMetadataLookupService.FormatSpotifyArtistsCandidate(
+            "Hai Triệu Năm 2", "Đen & Biên", 216000, "Hai Triệu Năm", "Đen", 216000, out _));
+        Assert.Null(MediaMetadataLookupService.FormatSpotifyArtistsCandidate(
+            "Hai Triệu Năm (Live At Show Của Đen)", "Đen & Biên", 216000, "Hai Triệu Năm", "Đen", 216000, out _));
+        // Rejects when primary artist is not first artist
+        Assert.Null(MediaMetadataLookupService.FormatSpotifyArtistsCandidate(
+            "Hai Triệu Năm", "Madihu & Đen", 216000, "Hai Triệu Năm", "Đen", 216000, out _));
+        // Rejects when duration differs by > 4 seconds (e.g. 209s vs 216s)
+        Assert.Null(MediaMetadataLookupService.FormatSpotifyArtistsCandidate(
+            "Hai Triệu Năm", "Đen & Madihu", 209735, "Hai Triệu Năm", "Đen", 216472, out _));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task SpotifyLocalArtistsAreCompleteWithoutWaitingForAnyNetworkRequest(bool online)
+    {
+        using var handler = new Handler(_ => throw new InvalidOperationException("Local metadata must not query the network"));
+        using var client = new HttpClient(handler);
+        var local = new SpotifyLocalMetadataReader(() => new("damsay (feat. Machiot)", "SIVAN, Machiot"));
+        var service = new MediaMetadataLookupService(client, client, () => online, () => null, local);
+
+        Assert.Equal("SIVAN, Machiot", await service.TryGetSpotifyFullArtistsAsync("damsay (feat. Machiot)", "SIVAN")
+            .WaitAsync(TimeSpan.FromSeconds(2)));
+        Assert.Empty(handler.Requests);
+    }
+
+    [Fact]
+    public async Task SoloSpotifyArtistStopsAtFirstMatchedProviderInsteadOfCascadingAllFallbacks()
+    {
+        using var handler = new Handler(request =>
+        {
+            var uri = request.RequestUri!;
+            if (uri.Host == "open.spotify.com" && uri.AbsolutePath.EndsWith("/server-time"))
+                return Json(new { serverTime = 1700000000 });
+            if (uri.Host == "open.spotify.com" && uri.AbsolutePath.EndsWith("/token"))
+                return Json(new { accessToken = "anon-token", accessTokenExpirationTimestampMs = 4102444800000L, isAnonymous = true });
+            if (uri.Host == "api-partner.spotify.com" && uri.AbsolutePath.EndsWith("/pathfinder/v2/query"))
+            {
+                return Json(new
+                {
+                    data = new
+                    {
+                        searchV2 = new
+                        {
+                            tracksV2 = new
+                            {
+                                items = new[]
+                                {
+                                    new
+                                    {
+                                        item = new
+                                        {
+                                            data = new
+                                            {
+                                                __typename = "Track",
+                                                id = "3333333333333333333333",
+                                                name = "Dưới Tán Cây Khô Hoa Nở",
+                                                artists = new
+                                                {
+                                                    items = new[]
+                                                    {
+                                                        new { profile = new { name = "Jack - J97" } }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+            throw new InvalidOperationException($"Unexpected fallback request to {uri}");
+        });
+        using var client = new HttpClient(handler);
+        string? artists = await Service(client).TryGetSpotifyFullArtistsAsync(
+            "Dưới Tán Cây Khô Hoa Nở", "Jack - J97", TimeSpan.FromSeconds(282));
+        Assert.Equal("Jack - J97", artists);
+        Assert.DoesNotContain(handler.Requests, u => u.Host is "itunes.apple.com" or "api.deezer.com");
+    }
+
+    private static MediaMetadataLookupService Service(HttpClient client, string? apiKey = null, bool allowed = true) =>
+        new(client, client, () => allowed, () => apiKey);
+    private static string NewId() => Guid.NewGuid().ToString("N")[..11];
+    private static HttpResponseMessage Json(object value) => Body(JsonSerializer.Serialize(value));
+    private static HttpResponseMessage Body(string body) => new(HttpStatusCode.OK) { Content = new StringContent(body) };
+    private sealed class Handler(Func<HttpRequestMessage, HttpResponseMessage> response) : HttpMessageHandler
+    {
+        internal List<Uri> Requests { get; } = new();
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            lock (Requests) Requests.Add(request.RequestUri!);
+            return Task.FromResult(response(request));
+        }
+    }
+}

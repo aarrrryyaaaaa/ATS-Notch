@@ -1,0 +1,313 @@
+using System.IO;
+using System.Runtime.CompilerServices;
+using System.Windows;
+using System.Windows.Controls;
+using System.Windows.Markup;
+using System.Windows.Media;
+using System.Windows.Media.Animation;
+using System.Windows.Media.Imaging;
+using System.Xml.Linq;
+using Xunit;
+
+namespace VNotch.Tests;
+
+[Collection("Localization")]
+public sealed class LyricsMultilineLayoutTests
+{
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void CalendarPositionStaysFixedWhenUnavailableSubtitlesFinishFading(bool showGreeting)
+    {
+        SharedStaTestRunner.Run(() =>
+        {
+            XNamespace ui = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+            XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+            var source = LoadSource();
+            var lyrics = source.Descendants(ui + "Border").Single(e => (string?)e.Attribute(x + "Name") == "LyricsWidget");
+            var calendar = source.Descendants(ui + "Border").Single(e => (string?)e.Attribute(x + "Name") == "CalendarWidget");
+            var greeting = source.Descendants(ui + "Grid").Single(e => (string?)e.Attribute(x + "Name") == "GreetingSection");
+            // Keep the production layout tree, substituting representative content sizes.
+            XElement LayoutElement(XElement element)
+            {
+                bool isLyrics = element == lyrics;
+                bool isCalendar = element == calendar;
+                bool isGreeting = element == greeting;
+                var result = new XElement(element.Name,
+                    element.Attributes().Where(a => a.Name.LocalName is "VerticalAlignment" or "Height" or "Margin" or "Grid.Row" or "Grid.RowSpan"));
+                if (isLyrics || isCalendar || isGreeting)
+                {
+                    string elementName = "Greeting";
+                    if (isLyrics) elementName = "Lyrics";
+                    else if (isCalendar) elementName = "Calendar";
+                    result.SetAttributeValue(x + "Name", elementName);
+                    if (!isLyrics) result.SetAttributeValue("Height", isCalendar ? "80" : "16");
+                    if (isGreeting && !showGreeting) result.SetAttributeValue("Visibility", "Collapsed");
+                }
+                else
+                    foreach (var child in element.Elements())
+                        result.Add(child.Name == ui + "Grid.RowDefinitions" ? new XElement(child) : LayoutElement(child));
+                return result;
+            }
+            var hostXaml = LayoutElement(lyrics.Parent!);
+            hostXaml.SetAttributeValue(XNamespace.Xmlns + "x", x);
+            var host = (Grid)XamlReader.Parse(hostXaml.ToString());
+            var root = new Grid();
+            root.Children.Add(host);
+            var calendarView = (FrameworkElement)host.FindName("Calendar");
+            var lyricsView = (FrameworkElement)host.FindName("Lyrics");
+            Layout();
+            var before = calendarView.TransformToAncestor(root).Transform(new Point());
+            lyricsView.Visibility = Visibility.Collapsed;
+            Layout();
+            Assert.Equal(before, calendarView.TransformToAncestor(root).Transform(new Point()));
+
+            void Layout()
+            {
+                root.Measure(new Size(190, 180));
+                root.Arrange(new Rect(0, 0, 190, 180));
+                root.UpdateLayout();
+            }
+        });
+    }
+
+    [Fact]
+    public void AutoRowHostDoesNotResizeWhenOldMultilineContentIsCleared()
+    {
+        SharedStaTestRunner.Run(() =>
+        {
+            XNamespace ui = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+            XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+            var source = LoadSource();
+            var widgetXaml = source.Descendants(ui + "Border").Single(e => (string?)e.Attribute(x + "Name") == "LyricsWidget");
+            var host = new Grid { VerticalAlignment = VerticalAlignment.Center };
+            host.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            host.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            var layer = new Grid();
+            var widget = new Border { Padding = new Thickness(4, 2, 7, 2), Margin = new Thickness(0, 0, 10, 2), Child = layer };
+            if (widgetXaml.Attribute("Height") is { } height)
+                widget.Height = double.Parse(height.Value, System.Globalization.CultureInfo.InvariantCulture);
+            Grid.SetRowSpan(widget, 2);
+            host.Children.Add(widget);
+            var incoming = new TextBlock { Text = "One line", LineHeight = 17, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, VerticalAlignment = VerticalAlignment.Center };
+            var outgoing = new TextBlock { LineHeight = 17, LineStackingStrategy = LineStackingStrategy.BlockLineHeight, VerticalAlignment = VerticalAlignment.Center };
+            layer.Children.Add(incoming);
+            layer.Children.Add(outgoing);
+            for (int lines = 2; lines <= 5; lines++)
+            {
+                outgoing.Text = string.Join("\n", Enumerable.Repeat("Previous line", lines));
+                Layout();
+                var before = incoming.TransformToAncestor(host).Transform(new Point());
+                double heightBefore = host.DesiredSize.Height;
+                outgoing.Text = "";
+                Layout();
+                Assert.Equal(heightBefore, host.DesiredSize.Height);
+                Assert.Equal(before, incoming.TransformToAncestor(host).Transform(new Point()));
+            }
+            void Layout()
+            {
+                host.Measure(new Size(190, 180));
+                host.Arrange(new Rect(0, 0, 190, host.DesiredSize.Height));
+                host.UpdateLayout();
+            }
+        });
+    }
+
+    [Theory]
+    [InlineData("First line\nSecond line")]
+    [InlineData("First line\nSecond line\nThird line")]
+    [InlineData("First line\nSecond line\nThird line\nFourth line")]
+    [InlineData("First line\nSecond line\nThird line\nFourth line\nFifth line")]
+    [InlineData("Một câu phụ đề dài cần tự xuống dòng khi không đủ chiều rộng hiển thị.")]
+    public void MultilineBoundsStayFixedWhenEntranceClockIsRemoved(string text)
+    {
+        SharedStaTestRunner.Run(() =>
+        {
+            var source = LoadSource();
+            XNamespace ui = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+            XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+            var resources = source.Descendants(ui + "Window.Resources").Single();
+            var host = new XElement(ui + "Grid",
+                new XAttribute(XNamespace.Xmlns + "x", x),
+                new XAttribute(XNamespace.Xmlns + "svc", "clr-namespace:VNotch.Services;assembly=ATS-Notch"),
+                new XElement(ui + "Grid.Resources",
+                    resources.Elements().Where(e => (string?)e.Attribute(x + "Key") is "MainSystemFont" or "SubtitleText")));
+            foreach (string name in new[] { "LyricTextA", "LyricTextB" })
+                host.Add(new XElement(source.Descendants(ui + "TextBlock").Single(e => (string?)e.Attribute(x + "Name") == name)));
+            var grid = (Grid)XamlReader.Parse(host.ToString());
+            foreach (double width in new[] { 130d, 190d })
+                foreach (TextBlock block in grid.Children)
+                {
+                    block.Text = "Short";
+                    Layout();
+                    block.Opacity = 0;
+                    block.Text = text;
+                    Layout();
+                    Assert.True(block.ActualHeight >= 34);
+                    var transform = (TranslateTransform)block.RenderTransform;
+                    transform.Y = 0;
+                    var slide = new DoubleAnimation(14, 0, TimeSpan.FromMilliseconds(450));
+                    var clock = (AnimationClock)slide.CreateClock(true);
+                    transform.ApplyAnimationClock(TranslateTransform.YProperty, clock);
+                    clock.Controller!.SeekAlignedToLastTick(TimeSpan.FromMilliseconds(450), TimeSeekOrigin.BeginTime);
+                    block.Opacity = 1;
+                    Layout();
+                    var animated = block.TransformToAncestor(grid).TransformBounds(new Rect(block.RenderSize));
+                    var animatedPixels = RenderPixels();
+                    transform.BeginAnimation(TranslateTransform.YProperty, null);
+                    Layout();
+                    var settled = block.TransformToAncestor(grid).TransformBounds(new Rect(block.RenderSize));
+                    Assert.Equal(animated, settled);
+                    Assert.Equal(animatedPixels, RenderPixels());
+
+                    byte[] RenderPixels()
+                    {
+                        var bitmap = new RenderTargetBitmap((int)width * 2, 280, 192, 192, PixelFormats.Pbgra32);
+                        bitmap.Render(grid);
+                        var pixels = new byte[bitmap.PixelWidth * bitmap.PixelHeight * 4];
+                        bitmap.CopyPixels(pixels, bitmap.PixelWidth * 4, 0);
+                        return pixels;
+                    }
+
+                    void Layout()
+                    {
+                        grid.Measure(new Size(width, 140));
+                        grid.Arrange(new Rect(0, 0, width, 140));
+                        grid.UpdateLayout();
+                    }
+                }
+        });
+    }
+
+    [Theory]
+    [InlineData(96)]
+    [InlineData(120)]
+    [InlineData(144)]
+    [InlineData(192)]
+    public void GlyphPositionsStayFixedWhenTheEntranceStops(int dpi) => SharedStaTestRunner.Run(() =>
+    {
+        var source = LoadSource();
+        XNamespace ui = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+        XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+        var resources = source.Descendants(ui + "Window.Resources").Single();
+        var host = new XElement(ui + "Grid",
+            new XAttribute(XNamespace.Xmlns + "x", x),
+            new XAttribute(XNamespace.Xmlns + "svc", "clr-namespace:VNotch.Services;assembly=ATS-Notch"),
+            new XElement(ui + "Grid.Resources",
+                resources.Elements().Where(e => (string?)e.Attribute(x + "Key") is "MainSystemFont" or "SubtitleText")),
+            new XElement(source.Descendants(ui + "TextBlock").Single(e => (string?)e.Attribute(x + "Name") == "LyricTextA")));
+        var grid = (Grid)XamlReader.Parse(host.ToString());
+        var block = (TextBlock)grid.Children[0];
+        block.Text = "Chờ một ngày người ta\ntrở về để nói lời hứa";
+        block.Opacity = 1;
+        grid.Measure(new Size(151.85, 130));
+        grid.Arrange(new Rect(0, 0, 151.85, 130));
+        grid.UpdateLayout();
+        var transform = (TranslateTransform)block.RenderTransform;
+        var slide = new DoubleAnimation(14, 0, TimeSpan.FromMilliseconds(450))
+        { EasingFunction = new ExponentialEase { Exponent = 5, EasingMode = EasingMode.EaseOut } };
+        var clock = (AnimationClock)slide.CreateClock(true);
+        transform.ApplyAnimationClock(TranslateTransform.YProperty, clock);
+        clock.Controller!.SeekAlignedToLastTick(TimeSpan.FromMilliseconds(449.999), TimeSeekOrigin.BeginTime);
+        var moving = Render();
+        clock.Controller.SeekAlignedToLastTick(TimeSpan.FromMilliseconds(450), TimeSeekOrigin.BeginTime);
+        var stopped = Render();
+        Assert.Equal(moving, stopped);
+
+        byte[] Render()
+        {
+            var bitmap = new RenderTargetBitmap((int)Math.Ceiling(160 * dpi / 96d), (int)Math.Ceiling(140 * dpi / 96d), dpi, dpi, PixelFormats.Pbgra32);
+            bitmap.Render(grid);
+            var pixels = new byte[bitmap.PixelWidth * bitmap.PixelHeight * 4];
+            bitmap.CopyPixels(pixels, bitmap.PixelWidth * 4, 0);
+            return pixels;
+        }
+    });
+
+    [Theory]
+    [InlineData(96)]
+    [InlineData(120)]
+    [InlineData(144)]
+    [InlineData(168)]
+    [InlineData(192)]
+    [InlineData(216)]
+    [InlineData(240)]
+    public void VietnameseDiacriticsAndRightEdgeHornsAreNeverClippedAcrossDpiAndWidths(double dpi)
+    {
+        SharedStaTestRunner.Run(() =>
+        {
+            var source = LoadSource();
+            XNamespace ui = "http://schemas.microsoft.com/winfx/2006/xaml/presentation";
+            XNamespace x = "http://schemas.microsoft.com/winfx/2006/xaml";
+            var resources = source.Descendants(ui + "Window.Resources").Single();
+            var host = new XElement(ui + "Grid",
+                new XAttribute(XNamespace.Xmlns + "x", x),
+                new XAttribute(XNamespace.Xmlns + "svc", "clr-namespace:VNotch.Services;assembly=ATS-Notch"),
+                new XElement(ui + "Grid.Resources",
+                    resources.Elements().Where(e => (string?)e.Attribute(x + "Key") is "MainSystemFont" or "SubtitleText")),
+                new XElement(source.Descendants(ui + "Border").Single(e => (string?)e.Attribute(x + "Name") == "LyricsWidget")));
+            var root = (Grid)XamlReader.Parse(host.ToString());
+            var widget = (Border)root.FindName("LyricsWidget");
+            var innerGrid = (Grid)widget.Child;
+            var layer = (Grid)root.FindName("AnimatedLyricsLayer");
+            var lyricA = (TextBlock)root.FindName("LyricTextA");
+            widget.Visibility = Visibility.Visible;
+            widget.Opacity = 1;
+            lyricA.Opacity = 1;
+
+            string[] samples =
+            [
+                "Chờ một ngày người ta\ntrở về để nói lời hứa từ\nlâu mà ai nỡ quên",
+                "Nhưng sao linh tính\ncủa anh đang thật tệ",
+                "Bình thường anh don't\ncare",
+                "Ẩn ức ở phương trời tư\nnhớ thương người dưng ừ\nửng hồng giấc mơ xưa"
+            ];
+
+            foreach (double width in new[] { 130d, 151.85d, 190d })
+                foreach (string sample in samples)
+                {
+                    lyricA.Text = sample;
+                    SetClipping(true);
+                    byte[] clipped = Render(width);
+                    SetClipping(false);
+                    byte[] unclipped = Render(width);
+                    for (int i = 0; i < clipped.Length; i++)
+                        Assert.True(Math.Abs(clipped[i] - unclipped[i]) <= 2, $"Clipped pixel at byte {i} (dpi={dpi}, width={width}): clipped={clipped[i]}, unclipped={unclipped[i]}");
+                }
+
+            void SetClipping(bool clip)
+            {
+                widget.ClipToBounds = clip;
+                innerGrid.ClipToBounds = clip;
+                layer.ClipToBounds = clip;
+                lyricA.ClipToBounds = clip;
+            }
+
+            byte[] Render(double width)
+            {
+                root.Measure(new Size(width, 130));
+                root.Arrange(new Rect(0, 0, width, 130));
+                root.UpdateLayout();
+                int pxW = (int)Math.Ceiling((width + 16) * dpi / 96.0);
+                int pxH = (int)Math.Ceiling(146 * dpi / 96.0);
+                var bmp = new RenderTargetBitmap(pxW, pxH, dpi, dpi, PixelFormats.Pbgra32);
+                bmp.Render(root);
+                var buf = new byte[pxW * pxH * 4];
+                bmp.CopyPixels(buf, pxW * 4, 0);
+                return buf;
+            }
+        });
+    }
+
+    private static XDocument LoadSource()
+    {
+        var document = XDocument.Load(SourcePath());
+        // Standalone fragments need an explicit assembly for application-local markup.
+        foreach (var font in document.Descendants(XName.Get("AppFont", "clr-namespace:VNotch.Services")).ToArray())
+            font.Name = XName.Get("AppFont", "clr-namespace:VNotch.Services;assembly=ATS-Notch");
+        return document;
+    }
+
+    private static string SourcePath([CallerFilePath] string file = "") =>
+        Path.GetFullPath(Path.Combine(Path.GetDirectoryName(file)!, "../Windows/MainWindow.xaml"));
+}
